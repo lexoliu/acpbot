@@ -1,0 +1,89 @@
+# acpbot configuration — copy to acpbot.toml and adjust.
+
+# kind = "cli" — the agent-debugging backend: no credentials, events arrive
+# as JSONL lines (see botkit-cli's wire protocol). Pick one transport:
+# [platform]
+# kind = "cli"
+# socket = "/tmp/acpbot.sock"   # unix socket drivers connect to
+# stdio = true                  # or drive the bot over stdin/stdout
+
+[platform]
+kind = "telegram"
+# Read the bot token from this environment variable (preferred):
+token_env = "TELEGRAM_BOT_TOKEN"
+# ... or set it directly:
+# token = "123456:..."
+# The bot's sticker set: pack files publish into it and send natively by
+# file_id. Sticker sets are owned by a *user*, managed by the bot — the
+# owner defaults to the first private-chat user to trigger a sticker send
+# (a private chat's id is its user's id); set it explicitly for group use.
+# sticker_set_owner = 123456789
+# Name/title — the name must end in _by_<bot username>. Defaults
+# "acpbot_by_<bot>" / "acpbot stickers".
+# sticker_set_name = "acpbot_by_mybot"
+# sticker_set_title = "acpbot stickers"
+
+[agent]
+# Defaults shown; all keys are optional.
+command = "devin"
+args = ["acp"]
+mode = "bypass"
+model = "swe-2-medium"
+# Seconds of event silence that triggers one history compaction per idle
+# stretch — prompt caches outlive this, so compacting is cheap and the
+# next message pays for a smaller context. 0 disables.
+idle_compact_secs = 1800
+# Seconds of outbound silence inside a turn before the daemon cancels the
+# turn and sends the agent a `nudge` event — the agent must message the
+# user, then resumes its task. The user never waits longer than this.
+# 0 disables the interrupt.
+nudge_after_secs = 10
+
+# How the agent process is isolated. Default shown; the whole table is
+# optional. Network is never restricted in any mode — the agent must reach
+# its model APIs, and the bridge must reach this daemon.
+[agent.isolation]
+# kind = "native" — macOS sandbox-exec / Linux Landlock+seccomp via `heel`.
+# The filesystem is locked to the chat working directory plus the grants
+# below; credentials, cloud config, browser data, and keychain stay
+# protected. The chat MCP tools reach the agent through the sandbox's own
+# IPC channel.
+kind = "native"
+# Host environment variables forwarded into the sandbox.
+# env_passthrough = ["OPENAI_API_KEY"]
+# Agent state dirs granted read+write (default ~/.devin, ~/.config/devin).
+# state_dirs = ["~/.devin", "~/.config/devin"]
+# Install dirs granted read+write+execute for toolchains that self-update
+# (default ~/.local/share/devin).
+# runtime_dirs = ["~/.local/share/devin"]
+# Extra filesystem grants: access is "r", "rw", "rx", or "rwx".
+# [[agent.isolation.grants]]
+# path = "~/toolchains/node"
+# access = "rx"
+
+# kind = "docker" — run the agent inside a container instead.
+# [agent.isolation]
+# kind = "docker"
+# image = "ghcr.io/you/agent-image"   # must contain `command` + bridge_command
+# home = "/root"                      # container home; ~/.devin and
+#                                     # ~/.config/devin are mounted under it
+# bridge_command = ["acpbot", "mcp-bridge"]  # argv inside the container
+# args = ["--memory=2g"]              # extra `docker run` flags
+
+# kind = "none" — run the agent directly on the host (debugging).
+# [agent.isolation]
+# kind = "none"
+
+# Optional persona prepended to every chat's generated AGENTS.md.
+# persona = "You are a cheerful participant in this group."
+
+# [paths]
+# Root for per-chat agent working dirs, the session registry, IPC sockets,
+# and transcripts. Default: ~/.local/share/acpbot
+# data_dir = "~/.local/share/acpbot"
+# Sticker pack directory (file stem = sticker name). .webp/.png are
+# static stickers, .tgs animated, .webm video; a stickers.toml inside can
+# give each a meaning and an emoji. First send publishes the file into the
+# bot's Telegram sticker set (see [platform]) and it goes out natively by
+# file_id.
+# stickers = "~/.local/share/acpbot/stickers"
