@@ -4,16 +4,19 @@ version = "0.1.0"
 edition = "2024"
 description = "Chat bot that forwards platform events to an ACP agent and lets the agent speak through MCP tools"
 license = "MIT OR Apache-2.0"
-publish = false
+repository = "https://github.com/lexoliu/acpbot"
+readme = "README.md"
+keywords = ["acp", "telegram", "chatbot", "agent"]
+categories = ["command-line-utilities"]
 
 [dependencies]
-aither-core = { path = "../aither/core" }
-aither-mcp = { path = "../aither/mcp" }
-aither-acp = { path = "../aither/acp" }
-botkit-core = { path = "../botkit/core" }
-botkit-telegram = { path = "../botkit/telegram" }
-botkit-cli = { path = "../botkit/cli" }
-heel = { path = "../native-sandbox", default-features = false }
+aither-core = { path = "../aither/core", version = "0.2.0" }
+aither-mcp = { path = "../aither/mcp", version = "0.2.0" }
+aither-acp = { path = "../aither/acp", version = "0.2.0" }
+botkit-core = { path = "../botkit/core", version = "0.1.0" }
+botkit-telegram = { path = "../botkit/telegram", version = "0.1.0" }
+botkit-cli = { path = "../botkit/cli", version = "0.1.0" }
+heel = { path = "../native-sandbox", version = "0.1.0", default-features = false }
 
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

@@ -1,0 +1,195 @@
+name: CI
+
+permissions:
+  checks: write
+  contents: read
+  id-token: write
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: 1.97.1
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: acpbot
+      # Path deps resolve against sibling checkouts; the published manifest
+      # strips `path` and uses the registry version instead.
+      - uses: actions/checkout@v4
+        with:
+          repository: lexoliu/aither
+          path: aither
+      - uses: actions/checkout@v4
+        with:
+          repository: lexoliu/botkit
+          path: botkit
+      - uses: actions/checkout@v4
+        with:
+          repository: lexoliu/heel
+          path: native-sandbox
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-ubuntu
+      - run: cargo fmt --all -- --check
+        working-directory: acpbot
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+        working-directory: acpbot
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: acpbot
+      - uses: actions/checkout@v4
+        with:
+          repository: lexoliu/aither
+          path: aither
+      - uses: actions/checkout@v4
+        with:
+          repository: lexoliu/botkit
+          path: botkit
+      - uses: actions/checkout@v4
+        with:
+          repository: lexoliu/heel
+          path: native-sandbox
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-ubuntu
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - run: cargo llvm-cov --all-features --lcov --output-path lcov.info
+        working-directory: acpbot
+      - uses: codecov/codecov-action@v5
+        with:
+          use_oidc: true
+          fail_ci_if_error: false
+          files: acpbot/lcov.info
+
+  typos:
+    name: Typos
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-ubuntu
+      - uses: crate-ci/typos@master
+
+  audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    permissions:
+      checks: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: acpbot
+      - uses: actions/checkout@v4
+        with:
+          repository: lexoliu/aither
+          path: aither
+      - uses: actions/checkout@v4
+        with:
+          repository: lexoliu/botkit
+          path: botkit
+      - uses: actions/checkout@v4
+        with:
+          repository: lexoliu/heel
+          path: native-sandbox
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-ubuntu
+      - name: Generate Lockfile
+        run: cargo generate-lockfile
+        working-directory: acpbot
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  unused-deps:
+    name: Unused Dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: acpbot
+      - uses: actions/checkout@v4
+        with:
+          repository: lexoliu/aither
+          path: aither
+      - uses: actions/checkout@v4
+        with:
+          repository: lexoliu/botkit
+          path: botkit
+      - uses: actions/checkout@v4
+        with:
+          repository: lexoliu/heel
+          path: native-sandbox
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-ubuntu
+      - uses: taiki-e/install-action@cargo-machete
+      - run: cargo machete
+        working-directory: acpbot
+
+  feature-checks:
+    name: Features
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: acpbot
+      - uses: actions/checkout@v4
+        with:
+          repository: lexoliu/aither
+          path: aither
+      - uses: actions/checkout@v4
+        with:
+          repository: lexoliu/botkit
+          path: botkit
+      - uses: actions/checkout@v4
+        with:
+          repository: lexoliu/heel
+          path: native-sandbox
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-ubuntu
+      - uses: taiki-e/install-action@cargo-hack
+      - run: cargo hack check --each-feature --no-dev-deps
+        working-directory: acpbot
+      - run: cargo hack check --feature-powerset --no-dev-deps
+        working-directory: acpbot
+
+  test:
+    name: Test
+    uses: ./.github/workflows/test.yml
