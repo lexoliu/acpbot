@@ -47,6 +47,7 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
         with:
+          workspaces: acpbot
           shared-key: ci-ubuntu
       - run: cargo fmt --all -- --check
         working-directory: acpbot
@@ -78,6 +79,7 @@ jobs:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
         with:
+          workspaces: acpbot
           shared-key: ci-ubuntu
       - uses: taiki-e/install-action@cargo-llvm-cov
       - run: cargo llvm-cov --all-features --lcov --output-path lcov.info
@@ -93,9 +95,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: ci-ubuntu
       - uses: crate-ci/typos@master
 
   audit:
@@ -122,6 +121,7 @@ jobs:
           path: native-sandbox
       - uses: Swatinem/rust-cache@v2
         with:
+          workspaces: acpbot
           shared-key: ci-ubuntu
       - name: Generate Lockfile
         run: cargo generate-lockfile
@@ -154,6 +154,7 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
         with:
+          workspaces: acpbot
           shared-key: ci-ubuntu
       - uses: taiki-e/install-action@cargo-machete
       - run: cargo machete
@@ -183,6 +184,7 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
         with:
+          workspaces: acpbot
           shared-key: ci-ubuntu
       - uses: taiki-e/install-action@cargo-hack
       - run: cargo hack check --each-feature --no-dev-deps

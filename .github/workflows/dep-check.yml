@@ -14,11 +14,26 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: acpbot
+      # Path deps resolve against sibling checkouts.
+      - uses: actions/checkout@v4
+        with:
+          repository: lexoliu/aither
+          path: aither
+      - uses: actions/checkout@v4
+        with:
+          repository: lexoliu/botkit
+          path: botkit
+      - uses: actions/checkout@v4
+        with:
+          repository: lexoliu/heel
+          path: native-sandbox
 
       - name: Detect project type
         id: detect
         run: |
-          if [ -f Cargo.toml ]; then
+          if [ -f acpbot/Cargo.toml ]; then
             echo "type=rust" >> "$GITHUB_OUTPUT"
           elif [ -f package.json ]; then
             echo "type=node" >> "$GITHUB_OUTPUT"
@@ -35,13 +50,17 @@ jobs:
       - name: Rust cache
         if: steps.detect.outputs.type == 'rust'
         uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: acpbot
 
       - name: Check Rust dependencies
         if: steps.detect.outputs.type == 'rust'
         run: |
           cargo install cargo-outdated --locked
+          cd acpbot
           cargo outdated -R --exit-code 1 > outdated.txt 2>&1 || true
           cat outdated.txt
+          mv outdated.txt ..
 
       - name: Setup Node
         if: steps.detect.outputs.type == 'node'

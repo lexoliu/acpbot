@@ -37,6 +37,7 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
         with:
+          workspaces: acpbot
           shared-key: test-${{ matrix.os }}
       - run: cargo test --verbose --all-features
         working-directory: acpbot

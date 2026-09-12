@@ -16,7 +16,7 @@ aither-acp = { path = "../aither/acp", version = "0.3" }
 botkit-core = { path = "../botkit/core", version = "0.1.0" }
 botkit-telegram = { path = "../botkit/telegram", version = "0.1.0" }
 botkit-cli = { path = "../botkit/cli", version = "0.1.0" }
-heel = { path = "../native-sandbox", version = "0.1.0", default-features = false }
+heel = { path = "../native-sandbox", version = "0.2.0", default-features = false }
 
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -30,7 +30,6 @@ async-io = "2.6"
 async-lock = "3"
 async-fs = "2.2"
 async-net = "2.0"
-blocking = "1"
 executor-core = "0.7.1"
 async-executor = "1.14"
 dirs = "6"
