@@ -126,9 +126,9 @@ jobs:
       - name: Generate Lockfile
         run: cargo generate-lockfile
         working-directory: acpbot
-      - uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: taiki-e/install-action@cargo-audit
+      - run: cargo audit
+        working-directory: acpbot
 
   unused-deps:
     name: Unused Dependencies
