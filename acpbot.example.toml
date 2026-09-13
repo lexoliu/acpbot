@@ -7,6 +7,15 @@
 # socket = "/tmp/acpbot.sock"   # unix socket drivers connect to
 # stdio = true                  # or drive the bot over stdin/stdout
 
+# kind = "discord" — the gateway websocket backend. Guild messages that
+# mention or reply to the bot are `direct`, other guild traffic arrives
+# `ambient`; DMs are always direct.
+# [platform]
+# kind = "discord"
+# token_env = "DISCORD_BOT_TOKEN"          # preferred over a literal token
+# token = "..."
+# application_id = "123456789012345678"    # from the developer portal
+
 [platform]
 kind = "telegram"
 # Read the bot token from this environment variable (preferred):

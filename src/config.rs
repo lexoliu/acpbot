@@ -53,6 +53,16 @@ pub enum PlatformConfig {
         /// Drive the bot over stdin/stdout instead of a socket.
         stdio: Option<bool>,
     },
+    /// Discord over the gateway websocket.
+    Discord {
+        /// Bot token. Prefer `token_env` so the secret stays out of the file.
+        token: Option<String>,
+        /// Environment variable holding the bot token.
+        token_env: Option<String>,
+        /// The application's id, from the Discord developer portal. Not a
+        /// secret; safe to commit.
+        application_id: String,
+    },
 }
 
 impl PlatformConfig {
@@ -77,6 +87,42 @@ impl PlatformConfig {
         token.clone().ok_or_else(|| {
             ConfigError::Invalid("telegram config needs `token` or `token_env`".to_string())
         })
+    }
+
+    /// Resolve the Discord bot token from `token_env` or `token`.
+    ///
+    /// # Errors
+    /// [`ConfigError::MissingEnv`] when `token_env` names an unset variable,
+    /// [`ConfigError::Invalid`] when neither token field is present or the
+    /// platform is not Discord.
+    pub fn discord_token(&self) -> Result<String, ConfigError> {
+        let Self::Discord {
+            token, token_env, ..
+        } = self
+        else {
+            return Err(ConfigError::Invalid(
+                "discord_token on a non-discord platform".to_string(),
+            ));
+        };
+        if let Some(var) = token_env {
+            return std::env::var(var).map_err(|_| ConfigError::MissingEnv(var.clone()));
+        }
+        token.clone().ok_or_else(|| {
+            ConfigError::Invalid("discord config needs `token` or `token_env`".to_string())
+        })
+    }
+
+    /// The Discord application id.
+    ///
+    /// # Errors
+    /// [`ConfigError::Invalid`] when the platform is not Discord.
+    pub fn discord_application_id(&self) -> Result<String, ConfigError> {
+        let Self::Discord { application_id, .. } = self else {
+            return Err(ConfigError::Invalid(
+                "discord_application_id on a non-discord platform".to_string(),
+            ));
+        };
+        Ok(application_id.clone())
     }
 
     /// The CLI transport the platform section configures.
@@ -115,7 +161,7 @@ impl PlatformConfig {
                 sticker_set_title.clone(),
                 *sticker_set_owner,
             ),
-            Self::Cli { .. } => (None, None, None),
+            Self::Cli { .. } | Self::Discord { .. } => (None, None, None),
         }
     }
 }

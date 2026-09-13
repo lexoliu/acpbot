@@ -11,6 +11,8 @@ use std::sync::atomic::{AtomicI64, AtomicU64};
 use async_channel::Sender as ChanSender;
 use botkit_core::action::{ChatAction, ChatActionGuard};
 use botkit_core::{BotError, FileSource};
+use botkit_discord::DiscordClient;
+use botkit_discord::action::DiscordActionSender;
 use botkit_telegram::action::TelegramActionSender;
 use botkit_telegram::{InlineKeyboardMarkup, MediaKind, ReplyMarkup, TelegramClient};
 use tracing::warn;
@@ -187,6 +189,8 @@ enum Platform {
     Telegram(TelegramSender),
     /// The CLI debug platform: outbound calls become wire-protocol lines.
     Cli(CliSender),
+    /// Discord.
+    Discord(DiscordSender),
     /// Records outbound calls instead of sending them; tests only.
     #[cfg(test)]
     Record(ChanSender<String>),
@@ -197,6 +201,13 @@ enum Platform {
 pub struct CliSender {
     hub: CliHub,
     chat: String,
+}
+
+/// Discord outbound operations bound to one channel.
+#[derive(Clone)]
+pub struct DiscordSender {
+    client: DiscordClient,
+    channel_id: String,
 }
 
 /// Telegram outbound operations bound to one chat.
@@ -249,6 +260,27 @@ impl Sender {
             platform: Platform::Cli(CliSender {
                 hub,
                 chat: key.id.to_string(),
+            }),
+            spoke,
+            thread,
+            last_action,
+            history: None,
+        }
+    }
+
+    /// A sender bound to the Discord channel the key names.
+    pub fn discord(
+        client: DiscordClient,
+        key: &ChatKey,
+        spoke: ChanSender<()>,
+        thread: Arc<AtomicI64>,
+        last_action: Arc<AtomicU64>,
+    ) -> Self {
+        debug_assert_eq!(key.platform, "discord");
+        Self {
+            platform: Platform::Discord(DiscordSender {
+                client,
+                channel_id: key.id.to_string(),
             }),
             spoke,
             thread,
@@ -319,6 +351,9 @@ impl Sender {
                     thread_id: self.thread(),
                 }));
             }
+            Platform::Discord(inner) => {
+                let _ = inner.client.trigger_typing(&inner.channel_id).await;
+            }
             #[cfg(test)]
             Platform::Record(_) => return,
         }
@@ -374,6 +409,14 @@ impl Sender {
                     }));
                     message_id
                 }
+                Platform::Discord(inner) => inner
+                    .client
+                    .send_message_payload(
+                        &inner.channel_id,
+                        &discord_payload(bubble, markup.as_ref(), None),
+                    )
+                    .await
+                    .map(|m| snowflake_id(&m.id))?,
                 #[cfg(test)]
                 Platform::Record(out) => {
                     out.send(format!("send:{bubble}"))
@@ -440,6 +483,19 @@ impl Sender {
                     }));
                     mid
                 }
+                Platform::Discord(inner) => inner
+                    .client
+                    .send_message_payload(
+                        &inner.channel_id,
+                        &discord_payload(
+                            bubble,
+                            markup.as_ref(),
+                            // The quote attaches to the first bubble.
+                            (i == 0).then_some(message_id),
+                        ),
+                    )
+                    .await
+                    .map(|m| snowflake_id(&m.id))?,
                 #[cfg(test)]
                 Platform::Record(out) => {
                     out.send(format!("reply:{message_id}:{bubble}"))
@@ -499,6 +555,21 @@ impl Sender {
                 }));
                 Ok(message_id)
             }
+            Platform::Discord(inner) => {
+                // No sticker store on Discord: the sticker goes out as a
+                // file upload.
+                inner
+                    .client
+                    .send_file(
+                        &inner.channel_id,
+                        FileSource::Path(sticker.path.clone()),
+                        &sticker.name,
+                        None,
+                    )
+                    .await
+                    .map(|m| snowflake_id(&m.id))
+                    .map_err(SenderError::from)
+            }
             #[cfg(test)]
             Platform::Record(out) => {
                 out.send(format!("sticker:{}", sticker.name))
@@ -547,6 +618,12 @@ impl Sender {
                 }));
                 Ok(message_id)
             }
+            // On Discord `file_id` is a CDN URL; re-uploading its bytes is
+            // the only way to echo it.
+            Platform::Discord(inner) => inner
+                .resend_url(file_id, None)
+                .await
+                .map_err(SenderError::from),
             #[cfg(test)]
             Platform::Record(out) => {
                 out.send(format!("sticker_id:{file_id}"))
@@ -597,6 +674,17 @@ impl Sender {
                 }));
                 Ok(message_id)
             }
+            Platform::Discord(inner) => inner
+                .client
+                .send_file(
+                    &inner.channel_id,
+                    FileSource::Path(path.to_path_buf()),
+                    filename(path)?,
+                    caption,
+                )
+                .await
+                .map(|m| snowflake_id(&m.id))
+                .map_err(SenderError::from),
             #[cfg(test)]
             Platform::Record(out) => {
                 out.send(format!("file:{}", path.display()))
@@ -644,6 +732,12 @@ impl Sender {
                 }));
                 Ok(message_id)
             }
+            // On Discord `file_id` is a CDN URL; re-uploading its bytes is
+            // the only way to echo it.
+            Platform::Discord(inner) => inner
+                .resend_url(file_id, caption)
+                .await
+                .map_err(SenderError::from),
             #[cfg(test)]
             Platform::Record(out) => {
                 out.send(format!("file_id:{kind:?}:{file_id}"))
@@ -761,6 +855,27 @@ impl Sender {
                 }
                 Ok(Some(relative(&abs)))
             }
+            Platform::Discord(inner) => {
+                // `file_id` is the attachment's CDN URL; its filename is
+                // the last path segment (query params stripped — CDN urls
+                // are signed).
+                let Some(name) = attachment_name(file_id) else {
+                    return Ok(None);
+                };
+                let abs = inbox.join(name);
+                if !abs.exists() {
+                    let bytes = match inner.client.download(file_id, DOWNLOAD_LIMIT).await {
+                        Ok(bytes) => bytes,
+                        Err(error) => {
+                            warn!(%error, "attachment download failed; event arrives without local copy");
+                            return Ok(None);
+                        }
+                    };
+                    async_fs::create_dir_all(&inbox).await?;
+                    async_fs::write(&abs, &bytes).await?;
+                }
+                Ok(Some(relative(&abs)))
+            }
             #[cfg(test)]
             Platform::Record(_) => Ok(None),
         }
@@ -789,6 +904,21 @@ impl Sender {
                     is_big,
                 }));
                 Ok(())
+            }
+            Platform::Discord(inner) => {
+                let message_id = message_id.to_string();
+                match emoji {
+                    // `is_big` has no Discord equivalent.
+                    Some(emoji) => inner
+                        .client
+                        .react(&inner.channel_id, &message_id, emoji)
+                        .await
+                        .map_err(|e| bot_err(e, snowflake_id(&message_id))),
+                    // Discord removes the bot's reaction per emoji, not
+                    // wholesale — without an emoji there is nothing to
+                    // clear.
+                    None => Ok(()),
+                }
             }
             #[cfg(test)]
             Platform::Record(out) => {
@@ -824,6 +954,12 @@ impl Sender {
                 }));
                 Ok(())
             }
+            Platform::Discord(inner) => inner
+                .client
+                .edit_message(&inner.channel_id, &message_id.to_string(), text)
+                .await
+                .map(|_| ())
+                .map_err(|e| bot_err(e, message_id)),
             #[cfg(test)]
             Platform::Record(out) => {
                 out.send(format!("edit:{message_id}:{text}"))
@@ -857,6 +993,11 @@ impl Sender {
                 }));
                 Ok(())
             }
+            Platform::Discord(inner) => inner
+                .client
+                .delete_message(&inner.channel_id, &message_id.to_string())
+                .await
+                .map_err(|e| bot_err(e, message_id)),
             #[cfg(test)]
             Platform::Record(out) => {
                 out.send(format!("delete:{message_id}"))
@@ -895,6 +1036,13 @@ impl Sender {
                 }));
                 Ok(())
             }
+            Platform::Discord(inner) => inner
+                .client
+                // `notify` has no Discord equivalent — pins always post a
+                // system message.
+                .pin_message(&inner.channel_id, &message_id.to_string(), unpin)
+                .await
+                .map_err(|e| bot_err(e, message_id)),
             #[cfg(test)]
             Platform::Record(out) => {
                 out.send(format!("pin:{message_id}:{unpin}"))
@@ -929,6 +1077,13 @@ impl Sender {
                 Err(BotError::Api(desc)) if desc.contains("not modified") => Ok(true),
                 Err(error) => Err(SenderError::Platform(error)),
             },
+            // A deleted message answers 404 to a plain GET.
+            Platform::Discord(inner) => inner
+                .client
+                .get_message(&inner.channel_id, &message_id.to_string())
+                .await
+                .map(|message| message.is_some())
+                .map_err(|e| bot_err(e, message_id)),
             // The CLI/test platforms have no deletable message store.
             Platform::Cli(_) => Ok(true),
             #[cfg(test)]
@@ -955,6 +1110,13 @@ impl Sender {
                 )),
                 ChatAction::Typing,
             ),
+            Platform::Discord(inner) => ChatActionGuard::start(
+                botkit_core::action::AnyChatActionSender::new(DiscordActionSender::new(
+                    inner.client.clone(),
+                    inner.channel_id.clone(),
+                )),
+                ChatAction::Typing,
+            ),
             #[cfg(test)]
             Platform::Record(_) => ChatActionGuard::start(
                 botkit_core::action::AnyChatActionSender::new(NoopAction),
@@ -964,10 +1126,102 @@ impl Sender {
     }
 }
 
-/// Whether the API error means the message no longer exists — every
-/// "Bad Request: message to <verb> not found" variant.
+impl DiscordSender {
+    /// Re-send an attachment Discord already hosts: `file_id` is its CDN
+    /// url, so the bytes come down and go back up as an upload.
+    async fn resend_url(&self, url: &str, caption: Option<&str>) -> Result<i64, BotError> {
+        let bytes = self.client.download(url, DOWNLOAD_LIMIT).await?;
+        let name = attachment_name(url).unwrap_or("file");
+        self.client
+            .send_file(&self.channel_id, FileSource::Bytes(bytes), name, caption)
+            .await
+            .map(|m| snowflake_id(&m.id))
+    }
+}
+
+/// A Discord snowflake id as the `i64` ids the tool layer uses. Real
+/// snowflakes sit far below `i64::MAX`; saturating keeps a hypothetical
+/// overflow representable instead of panicking.
+pub(crate) fn snowflake_id(id: &str) -> i64 {
+    id.parse::<u64>()
+        .map(|v| i64::try_from(v).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+/// The filename an attachment URL ends in — last path segment, query
+/// params stripped (CDN urls are signed).
+fn attachment_name(url: &str) -> Option<&str> {
+    let path = url.split('?').next()?;
+    path.rsplit('/').next().filter(|name| !name.is_empty())
+}
+
+/// The Discord channel-message payload for one bubble: `content`, button
+/// rows as components, and a `message_reference` when it quotes another
+/// message.
+fn discord_payload(
+    text: &str,
+    markup: Option<&InlineKeyboardMarkup>,
+    reply_to: Option<i64>,
+) -> serde_json::Value {
+    let mut payload = serde_json::json!({ "content": text });
+    if let Some(components) = markup_to_components(markup) {
+        payload["components"] = components;
+    }
+    if let Some(reply_to) = reply_to {
+        payload["message_reference"] = serde_json::json!({
+            "message_id": reply_to.to_string(),
+            // A quote of a since-deleted message sends as a plain message.
+            "fail_if_not_exists": false,
+        });
+    }
+    payload
+}
+
+/// Telegram-style button rows rendered as Discord action rows: a button
+/// with a `url` becomes a link button (style 5), anything else a primary
+/// button (style 1) keyed by `custom_id`.
+fn markup_to_components(markup: Option<&InlineKeyboardMarkup>) -> Option<serde_json::Value> {
+    let rows: Vec<serde_json::Value> = markup?
+        .inline_keyboard
+        .iter()
+        .map(|row| {
+            serde_json::json!({
+                "type": 1,
+                "components": row
+                    .iter()
+                    .map(|button| match &button.url {
+                        Some(url) => serde_json::json!({
+                            "type": 2,
+                            "style": 5,
+                            "label": button.text,
+                            "url": url,
+                        }),
+                        None => serde_json::json!({
+                            "type": 2,
+                            "style": 1,
+                            "label": button.text,
+                            // custom_id is mandatory for non-link buttons;
+                            // fall back to the label when no data was set.
+                            "custom_id": button
+                                .callback_data
+                                .clone()
+                                .unwrap_or_else(|| button.text.clone()),
+                        }),
+                    })
+                    .collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    (!rows.is_empty()).then_some(serde_json::Value::Array(rows))
+}
+
+/// Whether the API error means the message no longer exists — Telegram's
+/// "Bad Request: message to <verb> not found" variants and Discord's
+/// "Unknown Message" 404.
 fn message_gone(error: &BotError) -> bool {
-    matches!(error, BotError::Api(desc) if desc.contains("message") && desc.contains("not found"))
+    matches!(error, BotError::Api(desc) if
+        (desc.contains("message") && desc.contains("not found"))
+            || desc.contains("Unknown Message"))
 }
 
 /// Translate a platform error on `message_id`: a `not found` reply means

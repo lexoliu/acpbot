@@ -16,6 +16,7 @@ aither-acp = { path = "../aither/acp", version = "0.4" }
 botkit-core = { path = "../botkit/core", version = "0.2" }
 botkit-telegram = { path = "../botkit/telegram", version = "0.2" }
 botkit-cli = { path = "../botkit/cli", version = "0.1" }
+botkit-discord = { path = "../botkit/discord", version = "0.2" }
 heel = { path = "../native-sandbox", version = "0.3", default-features = false }
 
 serde = { version = "1.0", features = ["derive"] }
