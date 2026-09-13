@@ -94,7 +94,7 @@ impl PlatformConfig {
             return Ok(botkit_cli::Transport::Stdio);
         }
         match socket {
-            Some(path) => Ok(botkit_cli::Transport::Unix(path.clone())),
+            Some(path) => cli_socket_transport(path),
             None => Err(ConfigError::Invalid(
                 "cli platform needs `socket` or `stdio = true`".to_string(),
             )),
@@ -118,6 +118,22 @@ impl PlatformConfig {
             Self::Cli { .. } => (None, None, None),
         }
     }
+}
+
+/// The CLI `socket` transport — unix sockets exist only on unix; on Windows
+/// the `botkit-cli` wire runs over stdio only.
+#[cfg(unix)]
+fn cli_socket_transport(path: &std::path::Path) -> Result<botkit_cli::Transport, ConfigError> {
+    Ok(botkit_cli::Transport::Unix(path.to_path_buf()))
+}
+
+/// The CLI `socket` transport — unix sockets exist only on unix; on Windows
+/// the `botkit-cli` wire runs over stdio only.
+#[cfg(windows)]
+fn cli_socket_transport(_path: &std::path::Path) -> Result<botkit_cli::Transport, ConfigError> {
+    Err(ConfigError::Invalid(
+        "cli `socket` is unix-only; use `stdio = true`".to_string(),
+    ))
 }
 
 /// How to launch and configure the ACP agent process.

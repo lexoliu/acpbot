@@ -1,10 +1,9 @@
 name: Release
 
 on:
-  workflow_run:
-    workflows: ["CI"]
+  push:
     branches: [main]
-    types: [completed]
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -15,25 +14,88 @@ jobs:
   release-plz:
     name: Release
     runs-on: ubuntu-latest
-    if: github.event.workflow_run.conclusion == 'success'
+    # release-plz/git-config reads GITHUB_TOKEN to name the bot committer, and
+    # both release-plz commands take it, so it is a job-level variable.
     env:
-      RUST_TOOLCHAIN: 1.97.1
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
+      # Check out the branch rather than the pushed commit: release-plz runs
+      # `git rev-parse @{upstream}`, which needs a branch with an upstream.
       - uses: actions/checkout@v4
         with:
+          ref: main
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-semver-checks
+      # The water-rs fork of release-plz (from release-plz-v0.3.161, the
+      # version release-plz-action@v0.5 pins) treats a package it cannot
+      # compare with the registry as changed instead of aborting the whole
+      # run. Stock release-plz walks back to the commit that last touched a
+      # crate and runs `cargo package` there; older commits of this workspace
+      # referenced sibling checkouts by path, so that packaging fails and the
+      # release never gets past the first crate. Bump `rev` after rebasing
+      # the fork's branch onto a newer upstream tag.
+      - uses: taiki-e/cache-cargo-install-action@v3
         with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-      # Mint a short-lived crates.io token from the GitHub OIDC identity
-      # instead of a stored CARGO_REGISTRY_TOKEN (trusted publishing is
-      # configured per crate on crates.io).
+          tool: release-plz
+          git: https://github.com/water-rs/release-plz
+          rev: cc554a52e97e0ee359e45c7801d770895247cf27
+          locked: true
+      - uses: release-plz/git-config@v0.1.2
+      # The crates.io Trusted Publishing configuration for this crate points
+      # at this workflow, so crates.io mints a short-lived token from the
+      # GitHub OIDC token and no CARGO_REGISTRY_TOKEN secret is needed.
+      # crates.io refuses to mint tokens for `workflow_run` runs, which is why
+      # this workflow fires on the main push itself.
       - uses: rust-lang/crates-io-auth-action@v1
         id: crates-io-auth
-      - uses: MarcoIeni/release-plz-action@v0.5
-        with:
-          command: release
+      - name: Open or update the release pull request
+        run: >-
+          release-plz release-pr
+          --git-token "${GITHUB_TOKEN}"
+          --repo-url "https://github.com/${GITHUB_REPOSITORY}"
+          --forge github
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
-
+      # main only accepts merges from dev whose CI went green, but publishing
+      # still waits for this exact commit's own checks: the ruleset is the
+      # gate, this wait is what makes the release follow the tested commit
+      # rather than whatever push happened to land. This job's own check run
+      # is excluded so it cannot wait on itself.
+      - name: Wait for CI on this commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          deadline=$(( $(date +%s) + 5400 ))
+          # Outside the checkout: `cargo publish` refuses a dirty package dir,
+          # and the root crate's package dir is the repository root.
+          checks_file="${RUNNER_TEMP}/checks.tsv"
+          while :; do
+            gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/check-runs?per_page=100" \
+              --jq '.check_runs[] | select(.name != "Release") | [.name, (.conclusion // "pending")] | @tsv' \
+              > "${checks_file}" || true
+            if [ ! -s "${checks_file}" ]; then
+              echo "no check runs on ${GITHUB_SHA} yet"
+            elif grep -E '\t(failure|cancelled|timed_out|action_required|startup_failure|stale)$' "${checks_file}"; then
+              echo "::error::a check on ${GITHUB_SHA} did not pass (see list above)"
+              exit 1
+            elif ! grep -q $'\tpending$' "${checks_file}"; then
+              echo "all checks on ${GITHUB_SHA} passed"
+              exit 0
+            fi
+            if [ "$(date +%s)" -gt "${deadline}" ]; then
+              echo "::error::timed out waiting for checks on ${GITHUB_SHA}"
+              cat "${checks_file}"
+              exit 1
+            fi
+            sleep 30
+          done
+      - name: Publish unpublished packages
+        run: >-
+          release-plz release
+          --git-token "${GITHUB_TOKEN}"
+          --repo-url "https://github.com/${GITHUB_REPOSITORY}"
+          --forge github
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
