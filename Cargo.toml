@@ -10,9 +10,9 @@ keywords = ["acp", "telegram", "chatbot", "agent"]
 categories = ["command-line-utilities"]
 
 [dependencies]
-aither-core = { path = "../aither/core", version = "0.3" }
-aither-mcp = { path = "../aither/mcp", version = "0.3" }
-aither-acp = { path = "../aither/acp", version = "0.3" }
+aither-core = { path = "../aither/core", version = "0.4" }
+aither-mcp = { path = "../aither/mcp", version = "0.4" }
+aither-acp = { path = "../aither/acp", version = "0.4" }
 botkit-core = { path = "../botkit/core", version = "0.2" }
 botkit-telegram = { path = "../botkit/telegram", version = "0.2" }
 botkit-cli = { path = "../botkit/cli", version = "0.1" }
