@@ -13,9 +13,9 @@ categories = ["command-line-utilities"]
 aither-core = { path = "../aither/core", version = "0.3" }
 aither-mcp = { path = "../aither/mcp", version = "0.3" }
 aither-acp = { path = "../aither/acp", version = "0.3" }
-botkit-core = { path = "../botkit/core", version = "0.1.0" }
-botkit-telegram = { path = "../botkit/telegram", version = "0.1.0" }
-botkit-cli = { path = "../botkit/cli", version = "0.1.0" }
+botkit-core = { path = "../botkit/core", version = "0.2" }
+botkit-telegram = { path = "../botkit/telegram", version = "0.2" }
+botkit-cli = { path = "../botkit/cli", version = "0.1" }
 heel = { path = "../native-sandbox", version = "0.3", default-features = false }
 
 serde = { version = "1.0", features = ["derive"] }
