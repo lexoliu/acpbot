@@ -17,10 +17,25 @@ use tracing::{info, warn};
 
 use crate::error::McpServerError;
 
+/// The endpoint a chat's MCP server is reachable at.
+///
+/// Unix platforms use a socket path for host-side runtimes; Windows has no
+/// unix sockets, so every runtime there shares the loopback-TCP shape docker
+/// already uses.
+#[derive(Debug, Clone)]
+pub enum ChatEndpoint {
+    /// A unix socket path (`bare`/`native` on unix).
+    #[cfg(unix)]
+    Unix(PathBuf),
+    /// A bound TCP address (`docker` everywhere, every runtime on Windows).
+    Tcp(std::net::SocketAddr),
+}
+
 /// Bind `socket` and serve an MCP endpoint per connection.
 ///
 /// `make_tools` runs once per connection — each session's bridge gets an
 /// independent server task.
+#[cfg(unix)]
 pub fn spawn_unix_listener(
     socket: PathBuf,
     make_tools: impl Fn() -> Tools + Send + 'static,
@@ -45,20 +60,22 @@ pub fn spawn_unix_listener(
     Ok(())
 }
 
-/// Bind a TCP listener for docker-mode bridges.
+/// Bind a TCP listener and return its bound address.
 ///
-/// Containers cannot connect to a host unix socket, so their `mcp-bridge`
-/// reaches the daemon on `host.docker.internal:<port>` instead. That name
-/// lands on the host's *external* interface through the Docker VM gateway —
-/// loopback would be unreachable — so the listener binds all interfaces on
-/// an ephemeral port. The port is never published and only the chat-tools
-/// surface is served.
-pub async fn spawn_tcp_listener(
+/// `expose` selects the bind interface: docker-mode bridges connect through
+/// `host.docker.internal`, which lands on the host's *external* interface
+/// through the Docker VM gateway — loopback would be unreachable — so the
+/// listener binds all interfaces on an ephemeral port. Host-side consumers
+/// (Windows runtimes) pass `false` and stay on loopback. The port is never
+/// published and only the chat-tools surface is served.
+async fn spawn_tcp_listener_on(
+    expose: bool,
     make_tools: impl Fn() -> Tools + Send + 'static,
-) -> Result<u16, McpServerError> {
-    let listener = async_net::TcpListener::bind("0.0.0.0:0").await?;
-    let port = listener.local_addr()?.port();
-    info!(port, "chat tools listening (tcp)");
+) -> Result<std::net::SocketAddr, McpServerError> {
+    let bind = if expose { "0.0.0.0:0" } else { "127.0.0.1:0" };
+    let listener = async_net::TcpListener::bind(bind).await?;
+    let addr = listener.local_addr()?;
+    info!(%addr, "chat tools listening (tcp)");
 
     executor_core::spawn(async move {
         loop {
@@ -70,7 +87,41 @@ pub async fn spawn_tcp_listener(
     })
     .detach();
 
-    Ok(port)
+    Ok(addr)
+}
+
+/// Bind a chat's MCP endpoint for host-side runtimes: a unix socket on unix,
+/// a loopback TCP port on Windows. Returns the endpoint the bridge and the
+/// native relay use to reach it.
+#[cfg(unix)]
+pub async fn bind_host_endpoint(
+    socket: PathBuf,
+    make_tools: impl Fn() -> Tools + Send + 'static,
+) -> Result<ChatEndpoint, McpServerError> {
+    spawn_unix_listener(socket.clone(), make_tools)?;
+    Ok(ChatEndpoint::Unix(socket))
+}
+
+/// Bind a chat's MCP endpoint for host-side runtimes: a unix socket on unix,
+/// a loopback TCP port on Windows. Returns the endpoint the bridge and the
+/// native relay use to reach it.
+#[cfg(windows)]
+pub async fn bind_host_endpoint(
+    _socket: PathBuf,
+    make_tools: impl Fn() -> Tools + Send + 'static,
+) -> Result<ChatEndpoint, McpServerError> {
+    spawn_tcp_listener_on(false, make_tools)
+        .await
+        .map(ChatEndpoint::Tcp)
+}
+
+/// Bind the docker-mode MCP endpoint (`host.docker.internal` reachable).
+pub async fn bind_docker_endpoint(
+    make_tools: impl Fn() -> Tools + Send + 'static,
+) -> Result<ChatEndpoint, McpServerError> {
+    spawn_tcp_listener_on(true, make_tools)
+        .await
+        .map(ChatEndpoint::Tcp)
 }
 
 /// Serve one accepted stream as a chat MCP session.

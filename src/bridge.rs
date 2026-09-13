@@ -16,7 +16,9 @@
 //! talk to the wrong chat.
 
 use std::io::{BufRead, BufReader, Read, Write};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
+#[cfg(unix)]
 use std::path::Path;
 
 use serde::Serialize;
@@ -34,7 +36,7 @@ pub fn run(target: &str) -> Result<(), BridgeError> {
     } else if let Some(addr) = target.strip_prefix("tcp:") {
         run_tcp(addr)
     } else {
-        run_unix(Path::new(target))
+        run_socket_path(target)
     }
 }
 
@@ -49,6 +51,7 @@ trait Duplex: Read + Write + Send + 'static {
     fn close_write(&self) -> std::io::Result<()>;
 }
 
+#[cfg(unix)]
 impl Duplex for UnixStream {
     fn dup(&self) -> std::io::Result<Self> {
         self.try_clone()
@@ -67,8 +70,20 @@ impl Duplex for std::net::TcpStream {
     }
 }
 
-fn run_unix(socket: &Path) -> Result<(), BridgeError> {
-    pump(UnixStream::connect(socket)?)
+/// A bare target is a unix socket path — which Windows does not have, so
+/// there the daemon only ever emits `tcp:`/`ipc:` targets and a bare path
+/// is a config error.
+#[cfg(unix)]
+fn run_socket_path(target: &str) -> Result<(), BridgeError> {
+    pump(UnixStream::connect(Path::new(target))?)
+}
+
+/// A bare target is a unix socket path — which Windows does not have, so
+/// there the daemon only ever emits `tcp:`/`ipc:` targets and a bare path
+/// is a config error.
+#[cfg(windows)]
+fn run_socket_path(target: &str) -> Result<(), BridgeError> {
+    Err(BridgeError::UnsupportedTarget(target.to_string()))
 }
 
 fn run_tcp(addr: &str) -> Result<(), BridgeError> {

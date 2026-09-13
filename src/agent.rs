@@ -172,7 +172,7 @@ impl Dispatcher {
             ))),
             client: None,
             session_id: self.known_sessions.get(&key.slug()).cloned(),
-            bridge_target: None,
+            mcp_endpoint: None,
             runtime: None,
             child: None,
             thread: Arc::new(AtomicI64::new(0)),
@@ -244,8 +244,9 @@ struct ChatActor {
     history: Arc<crate::history::History>,
     client: Option<AcpClient<BotClientHandler>>,
     session_id: Option<String>,
-    /// The bound MCP endpoint + the argument `mcp-bridge` is configured with.
-    bridge_target: Option<String>,
+    /// The bound MCP endpoint — socket path on unix, loopback TCP where
+    /// unix sockets don't exist, docker's gateway TCP for `docker`.
+    mcp_endpoint: Option<crate::mcpserver::ChatEndpoint>,
     /// The chat's isolation runtime (sandbox/container), once created.
     runtime: Option<AgentRuntime>,
     /// The sandboxed child handle of the current agent process, if any.
@@ -298,7 +299,8 @@ impl ChatActor {
     /// chat's MCP endpoint — the host `acpbot` binary for `none`/`native`,
     /// the configured in-container command for `docker`.
     fn mcp_server_entry(&self) -> Result<(String, Vec<String>), AgentError> {
-        let target = self.bridge_target.clone().expect("bound first");
+        let endpoint = self.mcp_endpoint.as_ref().expect("bound first");
+        let target = BridgeTarget::for_isolation(&self.shared.agent.isolation, endpoint).arg();
         match &self.shared.agent.isolation {
             AgentIsolation::Docker(docker) => {
                 let (command, prefix) = docker.bridge_command.split_first().ok_or_else(|| {
@@ -648,8 +650,8 @@ impl ChatActor {
     /// Bring up the chat MCP endpoint, the isolation runtime, the agent
     /// process, and the ACP session.
     async fn ensure_ready(&mut self) -> Result<(), AgentError> {
-        if self.bridge_target.is_none() {
-            self.bridge_target = Some(self.bind_mcp_endpoint().await?);
+        if self.mcp_endpoint.is_none() {
+            self.mcp_endpoint = Some(self.bind_mcp_endpoint().await?);
         }
 
         let cwd = self.cwd();
@@ -661,7 +663,7 @@ impl ChatActor {
                     &self.shared.agent.isolation,
                     &self.shared.agent,
                     &cwd,
-                    &self.socket_path(),
+                    self.mcp_endpoint.as_ref().expect("bound above"),
                     &self.shared.bridge_bin,
                     &self.shared.sticker_dir,
                 )
@@ -732,10 +734,9 @@ impl ChatActor {
         Ok(())
     }
 
-    /// Bind this chat's MCP endpoint (unix socket or loopback TCP) and
-    /// return the `mcp-bridge` argument the generated `mcp_config.json`
-    /// carries.
-    async fn bind_mcp_endpoint(&mut self) -> Result<String, AgentError> {
+    /// Bind this chat's MCP endpoint — a unix socket on unix, loopback TCP
+    /// on Windows, docker's gateway listener for `docker` — and return it.
+    async fn bind_mcp_endpoint(&mut self) -> Result<crate::mcpserver::ChatEndpoint, AgentError> {
         let make_tools = {
             let sender = (self.shared.sender_for)(
                 &self.key,
@@ -759,18 +760,14 @@ impl ChatActor {
             }
         };
         match &self.shared.agent.isolation {
-            AgentIsolation::Docker(_) => {
-                let port = mcpserver::spawn_tcp_listener(make_tools).await?;
-                Ok(BridgeTarget::DockerTcp(port).arg())
-            }
-            isolation => {
+            AgentIsolation::Docker(_) => Ok(mcpserver::bind_docker_endpoint(make_tools).await?),
+            _ => {
                 let sock = self.socket_path();
                 if let Some(parent) = sock.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
                 let _ = std::fs::remove_file(&sock);
-                mcpserver::spawn_unix_listener(sock.clone(), make_tools)?;
-                Ok(BridgeTarget::for_isolation(isolation, &sock, 0).arg())
+                Ok(mcpserver::bind_host_endpoint(sock, make_tools).await?)
             }
         }
     }
