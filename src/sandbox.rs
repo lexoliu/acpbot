@@ -596,6 +596,11 @@ mod tests {
             "tcp:host.docker.internal:1234"
         );
         assert_eq!(
+            BridgeTarget::Tcp("127.0.0.1:1234".parse().unwrap()).arg(),
+            "tcp:127.0.0.1:1234"
+        );
+        #[cfg(unix)]
+        assert_eq!(
             BridgeTarget::Unix(PathBuf::from("/tmp/x.sock")).arg(),
             "/tmp/x.sock"
         );
