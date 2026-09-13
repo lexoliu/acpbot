@@ -1,7 +1,8 @@
 # acpbot
 
 A chat bot driven by an ACP agent. `acpbot run` starts the daemon: a botkit
-platform adapter (Telegram or the `botkit-cli` JSONL backend) turns every chat
+platform adapter (Telegram, Discord, or the `botkit-cli` JSONL backend) turns
+every chat
 event into an ACP `session/prompt` to a per-chat agent process (default
 `devin acp`), and the agent speaks back through `chat` MCP tools served by the
 same binary. `acpbot mcp-bridge` is the stdio↔socket link the agent spawns.
@@ -23,17 +24,18 @@ must do the same (see `ensure_executor` in test modules).
 ## Architecture
 
 - `bot.rs` — platform wiring: every update becomes a `ChatEvent` on the
-  dispatcher channel (`build` for Telegram, `build_cli` for the CLI backend).
-  Group messages get `attention`: `"direct"` (reply to the bot, @-mention,
-  command, button) vs `"ambient"` (room chatter the agent may still answer).
-  Needs the `getMe` identity — fetched once at startup.
+  dispatcher channel (`build`/`build_discord`/`build_cli`). Group messages get
+  `attention`: `"direct"` (reply to the bot, @-mention, command, button) vs
+  `"ambient"` (room chatter the agent may still answer). Needs the bot's own
+  identity — `getMe`/`GET /users/@me` — fetched once at startup.
 - `chat.rs` — `ChatEvent`, the JSON schema the agent sees; it is documented
   again in the per-chat `AGENTS.md` managed block, so the two never drift.
 - `agent.rs` — `Dispatcher` + per-chat `ChatActor`: spawns the ACP process,
   restores sessions (`session/resume` → `session/load` → `session/new`),
   forwards event batches as prompts, runs the first-reply watchdog and the
   idle-compaction timer.
-- `sender.rs` — `Platform` enum (`Telegram`, `Cli`, test `Record`): every
+- `sender.rs` — `Platform` enum (`Telegram`, `Discord`, `Cli`, test `Record`):
+  every
   outbound tool call lands here. `probe_message` checks whether a message
   still exists (a no-op `editMessageReplyMarkup` answers "not modified" on
   a live message, "to edit not found" on a deleted one) — Telegram pushes
@@ -69,6 +71,7 @@ must do the same (see `ensure_executor` in test modules).
 
 ## Config
 
-See `acpbot.example.toml`. `[platform]` selects `telegram` (token/token_env)
-or `cli` (`socket` unix path or `stdio = true`). `[agent]` sets the harness
+See `acpbot.example.toml`. `[platform]` selects `telegram` (token/token_env),
+`discord` (token/token_env + `application_id`), or `cli` (`socket` unix path
+or `stdio = true`). `[agent]` sets the harness
 command, model, isolation, and `idle_compact_secs`.

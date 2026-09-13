@@ -8,6 +8,9 @@
 use async_channel::Sender;
 use botkit_cli::{CliBot, CliContextData, Transport as CliTransport};
 use botkit_core::{Context, Response};
+use botkit_discord::{
+    DiscordBot, DiscordContextData, GatewayIntents, InteractionData, MessageContextData,
+};
 use botkit_telegram::types::{ChatType, EntityType, Message, Update, UpdateKind};
 use botkit_telegram::{TelegramBot, TelegramContextData};
 use tracing::warn;
@@ -27,15 +30,35 @@ pub struct BotIdentity {
     pub username: Option<String>,
 }
 
+/// The bot's own Discord identity (from `GET /users/@me`): guild messages
+/// are classified against it — a reply to the bot's message or an
+/// `@<id>` mention is `direct`, everything else in a guild is `ambient`.
+/// DMs are always direct.
+#[derive(Debug, Clone)]
+pub struct DiscordIdentity {
+    /// Snowflake user id of the bot account.
+    pub id: String,
+}
+
+/// Which platform's identity group events are classified against.
+#[derive(Debug, Clone)]
+enum Identity {
+    /// The CLI platform — attention arrives on the wire, nothing to
+    /// classify against.
+    None,
+    Telegram(BotIdentity),
+    Discord(DiscordIdentity),
+}
+
 /// A [`TelegramBot`] that forwards every event to `events`.
 pub fn build(token: String, events: Sender<ChatEvent>, me: BotIdentity) -> TelegramBot {
     let forward = {
         let events = events.clone();
         move |ctx: Context| {
             let events = events.clone();
-            let me = me.clone();
+            let me = Identity::Telegram(me.clone());
             async move {
-                if let Err(error) = forward(ctx, &events, Some(&me)).await {
+                if let Err(error) = forward(ctx, &events, me).await {
                     warn!(%error, "failed to forward chat event");
                 }
                 Response::empty()
@@ -64,7 +87,7 @@ pub fn build_cli(transport: CliTransport, events: Sender<ChatEvent>) -> CliBot {
         move |ctx: Context| {
             let events = events.clone();
             async move {
-                if let Err(error) = forward(ctx, &events, None).await {
+                if let Err(error) = forward(ctx, &events, Identity::None).await {
                     warn!(%error, "failed to forward chat event");
                 }
                 Response::empty()
@@ -78,14 +101,56 @@ pub fn build_cli(transport: CliTransport, events: Sender<ChatEvent>) -> CliBot {
         .fallback(forward)
 }
 
+/// A [`DiscordBot`] that forwards every event to `events`.
+///
+/// Slash commands and buttons reach the forwarder through `fallback` —
+/// nothing is registered with Discord; commands and buttons are data for
+/// the agent, not a menu.
+pub fn build_discord(
+    token: String,
+    application_id: String,
+    events: Sender<ChatEvent>,
+    me: DiscordIdentity,
+) -> DiscordBot {
+    let forward = {
+        let events = events.clone();
+        move |ctx: Context| {
+            let events = events.clone();
+            let me = Identity::Discord(me.clone());
+            async move {
+                if let Err(error) = forward(ctx, &events, me).await {
+                    warn!(%error, "failed to forward chat event");
+                }
+                Response::empty()
+            }
+        }
+    };
+
+    DiscordBot::new(
+        token,
+        application_id,
+        // Guild + DM messages, their contents, and reactions on both.
+        GatewayIntents::GUILDS
+            | GatewayIntents::GUILD_MESSAGES
+            | GatewayIntents::DIRECT_MESSAGES
+            | GatewayIntents::MESSAGE_CONTENT
+            | GatewayIntents::GUILD_MESSAGE_REACTIONS
+            | GatewayIntents::DIRECT_MESSAGE_REACTIONS,
+    )
+    .skip_command_registration()
+    .message(forward.clone())
+    .button("*", forward.clone())
+    .fallback(forward)
+}
+
 /// Build the [`ChatEvent`] a `Context` describes and enqueue it.
 async fn forward(
     ctx: Context,
     events: &Sender<ChatEvent>,
-    me: Option<&BotIdentity>,
+    me: Identity,
 ) -> Result<(), EventsClosed> {
     events
-        .send(to_event(&ctx, me))
+        .send(to_event(&ctx, &me))
         .await
         .map_err(|_| EventsClosed)
 }
@@ -102,11 +167,15 @@ impl std::fmt::Display for EventsClosed {
 
 impl std::error::Error for EventsClosed {}
 
-/// Translate the unified context plus the Telegram-specific payload into the
+/// Translate the unified context plus the platform-specific payload into the
 /// JSON event the agent receives.
-fn to_event(ctx: &Context, me: Option<&BotIdentity>) -> ChatEvent {
+fn to_event(ctx: &Context, me: &Identity) -> ChatEvent {
     let platform: &str = if ctx.platform::<CliContextData>().is_some() {
         "cli"
+    } else if ctx.platform::<MessageContextData>().is_some()
+        || ctx.platform::<DiscordContextData>().is_some()
+    {
+        "discord"
     } else {
         "telegram"
     };
@@ -134,13 +203,19 @@ fn to_event(ctx: &Context, me: Option<&BotIdentity>) -> ChatEvent {
     if let Some(data) = ctx.platform::<CliContextData>() {
         return extract_cli(data, base);
     }
+    if let Some(data) = ctx.platform::<MessageContextData>() {
+        return extract_discord_message(data, base, me);
+    }
+    if let Some(data) = ctx.platform::<DiscordContextData>() {
+        return extract_discord_interaction(data, base);
+    }
     match ctx.platform::<TelegramContextData>() {
-        Some(data) => extract_telegram(
-            ctx,
-            data,
-            base,
-            me.expect("telegram build always supplies the bot identity"),
-        ),
+        Some(data) => {
+            let Identity::Telegram(me) = me else {
+                unreachable!("telegram build always supplies the bot identity")
+            };
+            extract_telegram(ctx, data, base, me)
+        }
         None => extract_generic(ctx, base),
     }
 }
@@ -227,6 +302,143 @@ fn extract_cli(data: &CliContextData, mut event: ChatEvent) -> ChatEvent {
         Inbound::Subscribe => {}
     }
     event
+}
+
+/// A Discord `Message` (new or edited) becomes a message event: guild
+/// channels map to `group`, DMs to `private`, and snowflake ids to the
+/// `i64` the schema carries.
+fn extract_discord_message(
+    data: &MessageContextData,
+    mut event: ChatEvent,
+    me: &Identity,
+) -> ChatEvent {
+    let message = data.message();
+    event.kind = if data.edited { "edited" } else { "message" };
+    event.message_id = Some(snowflake(&message.id));
+    if let Some(ts) = discord_ts(message) {
+        event.ts = ts;
+    }
+    event.text = (!message.content.is_empty()).then(|| message.content.clone());
+    event.chat_type = Some(if message.guild_id.is_some() {
+        "group"
+    } else {
+        "private"
+    });
+    event.attention = discord_attention(message, me);
+    event.reply_to = message.referenced_message.as_ref().map(|m| EventReplyRef {
+        message_id: snowflake(&m.id),
+        from: Some(
+            m.author
+                .global_name
+                .clone()
+                .unwrap_or_else(|| m.author.username.clone()),
+        ),
+        text: (!m.content.is_empty()).then(|| m.content.clone()),
+    });
+    // `file_id` carries the attachment's CDN URL; `fetch_media` downloads it.
+    event.media = message.attachments.first().map(|a| EventMedia {
+        kind: discord_media_kind(a),
+        file_id: a.url.clone(),
+        file: None,
+    });
+    event
+}
+
+/// A Discord interaction — slash commands land in `command`, component
+/// presses in `button` (`custom_id` as the button payload, the pressed
+/// message's id and text alongside).
+fn extract_discord_interaction(data: &DiscordContextData, mut event: ChatEvent) -> ChatEvent {
+    // Interactions only exist on things aimed at the bot.
+    event.attention = "direct";
+    let interaction = data.interaction();
+    event.chat_type = Some(if interaction.guild_id.is_some() {
+        "group"
+    } else {
+        "private"
+    });
+    match &interaction.data {
+        Some(InteractionData::ApplicationCommand { name, options, .. }) => {
+            event.kind = "command";
+            event.command = Some(EventCommand {
+                name: name.clone(),
+                args: (!options.is_empty()).then(|| {
+                    options
+                        .iter()
+                        .map(|o| match &o.value {
+                            serde_json::Value::String(s) => format!("{}={s}", o.name),
+                            other => format!("{}={other}", o.name),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                }),
+            });
+        }
+        Some(
+            InteractionData::MessageComponent { custom_id, .. }
+            | InteractionData::ModalSubmit { custom_id, .. },
+        ) => {
+            event.kind = "button";
+            event.button = Some(custom_id.clone());
+            if let Some(message) = &interaction.message {
+                event.message_id = Some(snowflake(&message.id));
+                event.text = (!message.content.is_empty()).then(|| message.content.clone());
+            }
+        }
+        None => {}
+    }
+    event
+}
+
+/// `"direct"` when a guild message addresses the bot — a reply to one of
+/// its messages or an `@`-mention of its id — and on every DM; other
+/// guild traffic is room context.
+fn discord_attention(message: &botkit_discord::Message, me: &Identity) -> &'static str {
+    let Identity::Discord(me) = me else {
+        return "direct";
+    };
+    if message.guild_id.is_none() {
+        return "direct";
+    }
+    let replied_to_bot = message
+        .referenced_message
+        .as_ref()
+        .is_some_and(|m| m.author.id == me.id);
+    let mentioned = message.mentions.iter().any(|u| u.id == me.id);
+    if replied_to_bot || mentioned {
+        "direct"
+    } else {
+        "ambient"
+    }
+}
+
+/// The event-schema media kind a Discord attachment's content type implies.
+fn discord_media_kind(attachment: &botkit_discord::Attachment) -> &'static str {
+    match attachment
+        .content_type
+        .as_deref()
+        .and_then(|ct| ct.split('/').next())
+    {
+        Some("image") => "photo",
+        Some("video") => "video",
+        Some("audio") => "audio",
+        _ => "document",
+    }
+}
+
+/// A Discord snowflake as the `i64` the event schema carries — the same
+/// conversion outbound sends use to name messages.
+fn snowflake(id: &str) -> i64 {
+    crate::sender::snowflake_id(id)
+}
+
+/// Epoch seconds from Discord's ISO 8601 timestamp — `edited_timestamp`
+/// on edits, like Telegram's `edit_date`.
+fn discord_ts(message: &botkit_discord::Message) -> Option<i64> {
+    let stamp = message
+        .edited_timestamp
+        .as_deref()
+        .unwrap_or(&message.timestamp);
+    stamp.parse::<jiff::Timestamp>().ok().map(|t| t.as_second())
 }
 
 fn extract_telegram(

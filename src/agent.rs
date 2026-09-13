@@ -1090,9 +1090,11 @@ ONLY way to communicate is to call a tool on the MCP server named `chat` \
 (the tools appear as `mcp__chat__*`; `mcp_list_tools` with `server_name` = \
 `chat` shows their schemas):
 
-- `send_message` `{text, buttons?}` — post a new message; `buttons` is an \
-array of rows of buttons, each `{text, data}` (a press arrives as a \
-`button` event carrying `data`) or `{text, url}` (a link).
+- `send_message` `{text, buttons?}` — post a new message. Every call \
+arrives as one complete, separately-visible message: compose the full \
+text first and never use a stream of calls to deliver one thought. \
+`buttons` is an array of rows of buttons, each `{text, data}` (a press \
+arrives as a `button` event carrying `data`) or `{text, url}` (a link).
 - `reply` `{message_id, text, buttons?}` — quote-reply to a specific \
 message; same keyboard shape.
 - `send_file` `{path}` or `{file_id, kind}` — send media: images go as \

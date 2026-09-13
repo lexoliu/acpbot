@@ -73,13 +73,20 @@ fn main() -> Result<(), MainError> {
 }
 
 fn run(config_path: &Path) -> Result<(), MainError> {
-    let config = Config::load(config_path)?;
+    let mut config = Config::load(config_path)?;
     info!(config = %config_path.display(), data_dir = %config.paths.data_dir.display(), "starting acpbot");
 
     std::fs::create_dir_all(config.paths.data_dir.join("chats"))?;
     std::fs::create_dir_all(config.paths.data_dir.join("run"))?;
 
+    // Everything derived from `data_dir` — the session cwd, the bridge
+    // socket arg, the sticker path inside AGENTS.md — is resolved against
+    // the agent's own working directory, not the daemon's: a relative
+    // `data_dir` would point each of those at a path that doesn't exist.
+    config.paths.data_dir = std::fs::canonicalize(&config.paths.data_dir)?;
+
     let sticker_dir = config.paths.sticker_dir();
+    std::fs::create_dir_all(&sticker_dir)?;
 
     // botkit spawns handler work through executor-core; give it a global
     // executor before anything registers.
@@ -103,7 +110,6 @@ fn run(config_path: &Path) -> Result<(), MainError> {
         PlatformConfig::Telegram { .. } => {
             let token = config.platform.telegram_token()?;
             let client = TelegramClient::new(token.clone());
-            std::fs::create_dir_all(&sticker_dir)?;
             let (set_name, set_title, set_owner) = config.platform.telegram_sticker_set();
             let stickers = std::sync::Arc::new(StickerSet::new(
                 client.clone(),
@@ -155,6 +161,34 @@ fn run(config_path: &Path) -> Result<(), MainError> {
                     Ok(Sender::cli(hub.clone(), key, spoke, thread, last_action))
                 }),
                 Box::pin(cli_bot.run_until(shutdown)),
+                None,
+            )
+        }
+        PlatformConfig::Discord { .. } => {
+            let token = config.platform.discord_token()?;
+            let application_id = config.platform.discord_application_id()?;
+            let client = botkit_discord::DiscordClient::new(token.clone(), application_id.clone());
+            // Group attention classification needs the bot's own identity:
+            // guild messages mentioning or replying to it are `direct`.
+            let me = futures_lite::future::block_on(client.current_user())?;
+            info!(bot = ?me.username, id = %me.id, "bot identity");
+            let bot = bot::build_discord(
+                token,
+                application_id,
+                events_tx.clone(),
+                bot::DiscordIdentity { id: me.id },
+            );
+            (
+                Box::new(move |key, spoke, thread, last_action| {
+                    Ok(Sender::discord(
+                        client.clone(),
+                        key,
+                        spoke,
+                        thread,
+                        last_action,
+                    ))
+                }),
+                Box::pin(bot.run_until(shutdown)),
                 None,
             )
         }
