@@ -196,6 +196,12 @@ pub enum BridgeError {
     /// An IPC call to a daemon command failed.
     #[error("ipc call to {0} failed: {1}")]
     IpcCall(String, heel::IpcError),
+    /// A bare-path target on a platform without unix sockets.
+    #[cfg(windows)]
+    #[error(
+        "unix socket target {0:?} unsupported on this platform; use tcp:HOST:PORT or ipc:COMMAND"
+    )]
+    UnsupportedTarget(String),
 }
 
 /// The per-chat MCP socket listener failed.

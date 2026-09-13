@@ -32,6 +32,7 @@ use tracing::warn;
 
 use crate::config::{AgentConfig, AgentIsolation, DockerIsolation, GrantAccess, NativeIsolation};
 use crate::handler::BotClientHandler;
+use crate::mcpserver::ChatEndpoint;
 
 /// The IPC command the sandboxed `mcp-bridge` invokes for each JSON-RPC line.
 pub const CHAT_MCP_IPC: &str = "chat-mcp";
@@ -40,10 +41,14 @@ pub const CHAT_MCP_IPC: &str = "chat-mcp";
 #[derive(Debug, Clone)]
 pub enum BridgeTarget {
     /// `acpbot mcp-bridge <path>` — a unix socket on the host.
+    #[cfg(unix)]
     Unix(PathBuf),
     /// `acpbot mcp-bridge tcp:host.docker.internal:<port>` — the daemon's
     /// per-chat loopback listener, reached from inside the container.
     DockerTcp(u16),
+    /// `acpbot mcp-bridge tcp:127.0.0.1:<port>` — the host-side endpoint on
+    /// platforms without unix sockets (Windows `bare`/`native`).
+    Tcp(std::net::SocketAddr),
     /// `acpbot mcp-bridge ipc:chat-mcp` — relayed through the sandbox's IPC.
     Ipc,
 }
@@ -52,19 +57,30 @@ impl BridgeTarget {
     /// The argument `mcp-bridge` is invoked with.
     pub fn arg(&self) -> String {
         match self {
+            #[cfg(unix)]
             Self::Unix(path) => path.to_string_lossy().into_owned(),
             Self::DockerTcp(port) => format!("tcp:host.docker.internal:{port}"),
+            Self::Tcp(addr) => format!("tcp:{addr}"),
             Self::Ipc => format!("ipc:{CHAT_MCP_IPC}"),
         }
     }
 
-    /// The bridge target matching an isolation mode: unix for `none`, TCP
-    /// for `docker`, IPC relay for `native`.
-    pub fn for_isolation(isolation: &AgentIsolation, socket: &Path, tcp_port: u16) -> Self {
+    /// The bridge target matching an isolation mode over `endpoint`: the
+    /// socket path for `bare`, docker's gateway TCP for `docker`, and the
+    /// IPC relay for `native`.
+    pub fn for_isolation(isolation: &AgentIsolation, endpoint: &ChatEndpoint) -> Self {
         match isolation {
             AgentIsolation::Native(_) => Self::Ipc,
-            AgentIsolation::Docker(_) => Self::DockerTcp(tcp_port),
-            AgentIsolation::Bare => Self::Unix(socket.to_path_buf()),
+            AgentIsolation::Docker(_) => match endpoint {
+                ChatEndpoint::Tcp(addr) => Self::DockerTcp(addr.port()),
+                #[cfg(unix)]
+                ChatEndpoint::Unix(_) => unreachable!("docker endpoint is always tcp"),
+            },
+            AgentIsolation::Bare => match endpoint {
+                #[cfg(unix)]
+                ChatEndpoint::Unix(path) => Self::Unix(path.clone()),
+                ChatEndpoint::Tcp(addr) => Self::Tcp(*addr),
+            },
         }
     }
 }
@@ -116,14 +132,14 @@ impl AgentRuntime {
         isolation: &AgentIsolation,
         agent: &AgentConfig,
         cwd: &Path,
-        socket: &Path,
+        endpoint: &ChatEndpoint,
         bridge_bin: &Path,
         sticker_dir: &Path,
     ) -> Result<Self, SandboxError> {
         match isolation {
             AgentIsolation::Bare => Ok(Self::Bare),
             AgentIsolation::Native(native) => {
-                NativeRuntime::create(native, agent, cwd, socket, bridge_bin, sticker_dir)
+                NativeRuntime::create(native, agent, cwd, endpoint, bridge_bin, sticker_dir)
                     .await
                     .map(|runtime| Self::Native(Box::new(runtime)))
             }
@@ -162,7 +178,7 @@ impl NativeRuntime {
         native: &NativeIsolation,
         agent: &AgentConfig,
         cwd: &Path,
-        socket: &Path,
+        endpoint: &ChatEndpoint,
         bridge_bin: &Path,
         sticker_dir: &Path,
     ) -> Result<Self, SandboxError> {
@@ -174,7 +190,7 @@ impl NativeRuntime {
                 source,
             })?;
 
-        let relay = spawn_relay(socket.to_path_buf());
+        let relay = spawn_relay(endpoint.clone());
         let router = IpcRouter::new().register(McpRelay { tx: relay });
 
         // The sticker pack is deliberately writable: the agent evolves it —
@@ -420,16 +436,34 @@ impl IpcCommand for McpRelay {
     }
 }
 
-/// The split halves of the chat MCP socket, kept across relay calls so the
-/// buffered reader never loses bytes it read ahead of a response's newline.
+/// The split halves of the chat MCP connection, kept across relay calls so
+/// the buffered reader never loses bytes it read ahead of a response's
+/// newline. Boxed because the stream type differs per endpoint kind.
 type SocketConn = (
-    BufReader<futures_lite::io::ReadHalf<async_net::unix::UnixStream>>,
-    futures_lite::io::WriteHalf<async_net::unix::UnixStream>,
+    BufReader<Pin<Box<dyn futures_lite::AsyncRead + Send>>>,
+    Pin<Box<dyn futures_lite::AsyncWrite + Send>>,
 );
+
+/// Connect one stream to the chat's MCP endpoint.
+async fn connect_endpoint(endpoint: &ChatEndpoint) -> std::io::Result<SocketConn> {
+    match endpoint {
+        #[cfg(unix)]
+        ChatEndpoint::Unix(path) => {
+            let stream = async_net::unix::UnixStream::connect(path).await?;
+            let (reader, writer) = futures_lite::io::split(stream);
+            Ok((BufReader::new(Box::pin(reader)), Box::pin(writer)))
+        }
+        ChatEndpoint::Tcp(addr) => {
+            let stream = async_net::TcpStream::connect(addr).await?;
+            let (reader, writer) = futures_lite::io::split(stream);
+            Ok((BufReader::new(Box::pin(reader)), Box::pin(writer)))
+        }
+    }
+}
 
 /// Spawn the relay task that owns this chat's MCP socket connection for
 /// IPC-bridged calls.
-fn spawn_relay(socket: PathBuf) -> ChanSender<RelayRequest> {
+fn spawn_relay(endpoint: ChatEndpoint) -> ChanSender<RelayRequest> {
     let (tx, rx) = async_channel::unbounded::<RelayRequest>();
     executor_core::spawn(async move {
         // The connection persists for the sandbox's lifetime: MCP session
@@ -439,13 +473,10 @@ fn spawn_relay(socket: PathBuf) -> ChanSender<RelayRequest> {
         let mut buf = String::new();
         while let Ok(request) = rx.recv().await {
             if conn.is_none() {
-                conn = match async_net::unix::UnixStream::connect(&socket).await {
-                    Ok(stream) => {
-                        let (reader, writer) = futures_lite::io::split(stream);
-                        Some((BufReader::new(reader), writer))
-                    }
+                conn = match connect_endpoint(&endpoint).await {
+                    Ok(conn) => Some(conn),
                     Err(error) => {
-                        warn!(%error, socket = %socket.display(), "chat-mcp relay connect failed");
+                        warn!(%error, ?endpoint, "chat-mcp relay connect failed");
                         let _ = request.reply.send(None).await;
                         continue;
                     }
