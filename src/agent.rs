@@ -3,9 +3,16 @@
 //! One `devin acp` child process and ACP session serves every chat: a single
 //! actor owns the global event queue, so the model sees one context window
 //! across all conversations. The per-chat state that cannot be shared —
-//! platform [`Sender`]s, transcripts, forum-topic cells — lives in the
+//! platform [`Sender`]s, IM records, forum-topic cells — lives in the
 //! [`ChatRouter`], which also tracks the chat whose events triggered the
 //! in-flight turn so tools default to answering it.
+//!
+//! Continuity across incarnations is a file, not a session: a closing actor
+//! makes the agent write `CONTINUITY.md`, and a spawning actor opens a
+//! *fresh* session and injects that summary — so the harness or model can
+//! change on every restart. A session id in `sessions.json` is only a
+//! "died before handoff" marker: the next spawn restores it just long
+//! enough to extract the summary, then starts fresh anyway.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -13,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::error::{AgentError, SenderError};
 use aither_acp::{
@@ -64,9 +71,24 @@ pub struct AgentShared {
     pub sticker_library: Arc<crate::stickerlib::StickerLibrary>,
     /// Builds a platform sender bound to a chat.
     pub sender_for: SenderFactory,
-    /// Where the actor reports the session id once a session exists; the
-    /// dispatcher persists it so the shared session resumes on restart.
-    pub session_updates: ChanSender<String>,
+    /// Where the actor reports session lifecycle events; the dispatcher
+    /// persists them so an unclean exit can be recovered on next run.
+    pub session_updates: ChanSender<SessionUpdate>,
+}
+
+/// What the actor tells the dispatcher about the live session.
+///
+/// `sessions.json` no longer means "resume this on start" — a stored id is
+/// an *awaiting handoff* marker: a session that was never given the chance
+/// to write its `CONTINUITY.md` summary (crash, killed, timed-out handoff).
+#[derive(Debug)]
+pub enum SessionUpdate {
+    /// A session was established; if the daemon dies before `Closed`, the
+    /// next run must restore it long enough to extract the summary.
+    Established(String),
+    /// The session handed off cleanly — drop the stored id, nothing to
+    /// recover.
+    Closed,
 }
 
 /// Media above this many bytes stays an `inbox/` path in the event JSON
@@ -76,9 +98,42 @@ const MEDIA_INLINE_LIMIT: u64 = 8 * 1024 * 1024;
 
 /// The `sessions.json` key — and `chats/` subdirectory — of the one shared
 /// session. Per-chat slugs in a pre-shared `sessions.json` survive only so
-/// the first chat to speak after an upgrade can resume its old session as
-/// the shared one.
+/// the first spawn after an upgrade can recover their old session's
+/// summary into the shared `CONTINUITY.md`.
 const SHARED_SLUG: &str = "shared";
+
+/// The file the outgoing session writes its handoff summary into — and the
+/// file the next incarnation receives as its bootstrap prompt. Lives in
+/// the shared working directory so it survives sessions and harness swaps.
+const CONTINUITY_FILE: &str = "CONTINUITY.md";
+
+/// Hard bound on a handoff or bootstrap prompt: a wedged agent must not
+/// stall daemon shutdown or first-response forever — a timeout degrades
+/// into the crash-recovery path or a memory-less start.
+const HANDOFF_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The maintenance prompt that makes a session write its own handoff
+/// note — plain text so any harness can follow it.
+const HANDOFF_PROMPT: &str = "\
+The daemon is closing this session permanently — shutdown, restart, or a \
+harness swap. Write your handoff note to CONTINUITY.md in your working \
+directory (create or overwrite it): who you are, the chats and people you \
+know, what you were in the middle of, and what the next incarnation needs \
+to know. Plain markdown, as compact as accuracy allows. Do not call any \
+`chat` tools — nobody is watching; the file is this turn's only output. \
+Write it, then end the turn.";
+
+/// The preamble a fresh session's bootstrap prompt gets — the previous
+/// incarnation's `CONTINUITY.md` text is appended after it.
+const INJECT_PROMPT: &str = "\
+You just came online — a fresh session after a daemon restart (the model \
+or harness may have changed; this is how every incarnation starts). Below \
+is CONTINUITY.md, the handoff note your previous self wrote before \
+closing. Treat it as memory, not gospel: trust it for who you are and \
+what was in flight, and verify anything load-bearing against the real \
+chat records — `history`, `search_history`, `fetch_message`, `chat_info` \
+hold every message the bot saw or sent and outlive any session. Absorb it \
+quietly — no `chat` tool calls, nobody is waiting — then end the turn.";
 
 /// The [`ChatKey`] an event belongs to.
 fn key_of(event: &ChatEvent) -> ChatKey {
@@ -89,7 +144,7 @@ fn key_of(event: &ChatEvent) -> ChatKey {
 }
 
 /// The registry from [`ChatKey`] to the per-chat state the shared agent
-/// still needs: a chat's platform [`Sender`], its transcript [`History`],
+/// still needs: a chat's platform [`Sender`], its IM record [`History`],
 /// and its forum-topic cell — plus `current`, the chat whose events
 /// triggered the in-flight turn, which tools resolve to when their `chat`
 /// argument is omitted.
@@ -114,7 +169,7 @@ pub struct ChatRouter {
 struct RouterState {
     /// One sender per chat, built on demand.
     senders: HashMap<ChatKey, Sender>,
-    /// One transcript per chat.
+    /// One IM record per chat.
     histories: HashMap<ChatKey, Arc<History>>,
     /// One forum-topic cell per chat — lives outside the senders so the
     /// actor can set a topic before that chat's sender exists.
@@ -124,7 +179,7 @@ struct RouterState {
 }
 
 impl RouterState {
-    /// The transcript of `key` (`<data>/chats/<slug>/history.jsonl`),
+    /// The IM record of `key` (`<data>/chats/<slug>/history.jsonl`),
     /// opened on first use.
     fn history(&mut self, key: &ChatKey, data_dir: &Path) -> Arc<History> {
         self.histories
@@ -182,7 +237,7 @@ impl ChatRouter {
             .store(thread_id, Ordering::Relaxed);
     }
 
-    /// The transcript of `key`, opened on first use.
+    /// The IM record of `key`, opened on first use.
     pub fn history(&self, key: &ChatKey) -> Arc<History> {
         self.state
             .lock()
@@ -240,10 +295,10 @@ impl ChatRouter {
         self.sender(&key).map_err(|e| e.to_string())
     }
 
-    /// `resolve` + `history` + `sender` — the transcript tools' target.
+    /// `resolve` + `history` + `sender` — the IM-record tools' target.
     /// The sender comes along so returned records can be probed for
     /// deletion.
-    pub fn transcript_for(&self, chat: Option<&str>) -> Result<(Arc<History>, Sender), String> {
+    pub fn history_for(&self, chat: Option<&str>) -> Result<(Arc<History>, Sender), String> {
         let key = self.resolve(chat)?;
         let sender = self.sender(&key).map_err(|e| e.to_string())?;
         Ok((self.history(&key), sender))
@@ -259,8 +314,8 @@ pub struct Dispatcher {
     /// `sessions.json` — slug → session id. The live session sits under
     /// [`SHARED_SLUG`]; per-chat slugs remain only for the upgrade handoff.
     known_sessions: HashMap<String, String>,
-    /// Receives the session id the actor establishes.
-    session_ids: Receiver<String>,
+    /// Receives the session lifecycle events the actor reports.
+    session_ids: Receiver<SessionUpdate>,
     /// Cloned into the actor; dropping the sender ends its in-flight turn
     /// so a daemon shutdown never leaves a sandboxed agent running.
     shutdown: (Option<ChanSender<()>>, Receiver<()>),
@@ -308,17 +363,13 @@ impl Dispatcher {
             // its own for shutdown to ever leave this loop.
             let event = futures_lite::future::race(
                 async { events.recv().await.map(|e| Routed::Event(Box::new(e))) },
-                async { self.session_ids.recv().await.map(Routed::SessionId) },
+                async { self.session_ids.recv().await.map(Routed::SessionUpdate) },
             )
             .await;
             match event {
                 Ok(Routed::Event(event)) => self.dispatch(*event).await,
-                Ok(Routed::SessionId(sid)) => {
-                    // The shared session supersedes every per-chat id —
-                    // once it exists the legacy slugs are dead weight.
-                    self.known_sessions.clear();
-                    self.known_sessions.insert(SHARED_SLUG.to_string(), sid);
-                    save_sessions(&self.shared.data_dir, &self.known_sessions);
+                Ok(Routed::SessionUpdate(update)) => {
+                    self.apply_session_update(update);
                 }
                 Err(_) => break,
             }
@@ -326,20 +377,37 @@ impl Dispatcher {
 
         // The event channel closed: the daemon is shutting down. Closing the
         // shutdown channel interrupts an in-flight turn; dropping the actor's
-        // sender ends its run loop; awaiting its task lets the actor drop its
-        // runtime — a heel Sandbox kills the agent process on the way out.
+        // sender ends its run loop; awaiting its task lets the actor write
+        // the handoff summary and drop its runtime — a heel Sandbox kills
+        // the agent process on the way out.
         drop(self.shutdown.0.take());
         if let Some((tx, task)) = self.actor.take() {
             drop(tx);
             task.await;
         }
-        // The actor can report its session id right up to its task's end —
-        // drain what arrived so the next run resumes it.
-        while let Ok(sid) = self.session_ids.try_recv() {
-            self.known_sessions.clear();
-            self.known_sessions.insert(SHARED_SLUG.to_string(), sid);
-            save_sessions(&self.shared.data_dir, &self.known_sessions);
+        // The actor can report session updates right up to its task's end —
+        // drain what arrived so recovery state lands on disk.
+        while let Ok(update) = self.session_ids.try_recv() {
+            self.apply_session_update(update);
         }
+    }
+
+    /// Persist one actor-reported session event into `sessions.json`: an
+    /// established session becomes the recovery handle, a cleanly closed
+    /// one drops the marker entirely.
+    fn apply_session_update(&mut self, update: SessionUpdate) {
+        match update {
+            SessionUpdate::Established(sid) => {
+                // The live session supersedes every other id — it is the
+                // one a crash recovery would have to summarize.
+                self.known_sessions.clear();
+                self.known_sessions.insert(SHARED_SLUG.to_string(), sid);
+            }
+            SessionUpdate::Closed => {
+                self.known_sessions.remove(SHARED_SLUG);
+            }
+        }
+        save_sessions(&self.shared.data_dir, &self.known_sessions);
     }
 
     async fn dispatch(&mut self, event: ChatEvent) {
@@ -349,10 +417,11 @@ impl Dispatcher {
             return;
         }
 
-        // No actor yet (or it died): spawn the shared one. The session it
-        // resumes is `shared` from a previous run — or, on upgrade from the
-        // per-chat layout, the triggering chat's own session, so that
-        // conversation's context becomes the shared context.
+        // No actor yet (or it died): spawn the shared one. A session id
+        // under `shared` — or, on upgrade from the per-chat layout, the
+        // triggering chat's slug — marks a session that never handed off;
+        // the actor restores it only to extract CONTINUITY.md before
+        // starting fresh.
         let key = key_of(&event);
         let session_id = self
             .known_sessions
@@ -381,6 +450,7 @@ impl Dispatcher {
             child: None,
             prompt_caps: PromptCapabilities::default(),
             compact_supported: Arc::new(AtomicBool::new(false)),
+            session_turns: 0,
             spoke_rx,
             last_action,
             restart_tx,
@@ -397,7 +467,7 @@ impl Dispatcher {
 
 enum Routed {
     Event(Box<ChatEvent>),
-    SessionId(String),
+    SessionUpdate(SessionUpdate),
 }
 
 /// What [`wait_event`] resolved to.
@@ -439,11 +509,14 @@ impl Drop for TurnTyping {
 /// The one agent process, ACP session, and event queue every chat shares.
 struct ChatActor {
     shared: Arc<AgentShared>,
-    /// Per-chat senders, transcripts, and topic cells — plus `current`,
+    /// Per-chat senders, IM records, and topic cells — plus `current`,
     /// the chat whose events triggered the in-flight turn. Shared with
     /// every tool the chat MCP endpoint serves.
     router: Arc<ChatRouter>,
     client: Option<AcpClient<BotClientHandler>>,
+    /// A session awaiting handoff — handed in by the dispatcher or held
+    /// across a mid-run respawn. Restored only to extract `CONTINUITY.md`,
+    /// then replaced by a fresh session; never resumed into duty.
     session_id: Option<String>,
     /// The bound MCP endpoint — socket path on unix, loopback TCP where
     /// unix sockets don't exist, docker's gateway TCP for `docker`.
@@ -474,6 +547,10 @@ struct ChatActor {
     /// harness handles a `compact` command, so idle compaction is a local
     /// operation rather than text the model would answer in the chat.
     compact_supported: Arc<AtomicBool>,
+    /// Turns the current session has run. `0` means a fresh session with
+    /// nothing to summarize — a handoff then would only overwrite a better
+    /// `CONTINUITY.md` with a thin one, so `graceful_close` skips it.
+    session_turns: u64,
 }
 
 impl ChatActor {
@@ -517,7 +594,7 @@ impl ChatActor {
         self.cwd().join("transcript.log")
     }
 
-    /// The transcript of the chat `event` belongs to.
+    /// The IM record of the chat `event` belongs to.
     fn log_event(&self, event: &ChatEvent) {
         self.router.history(&key_of(event)).append_event(event);
     }
@@ -537,12 +614,12 @@ impl ChatActor {
                 let first = if idle_compacted || idle.is_zero() {
                     match rx.recv().await {
                         Ok(event) => event,
-                        Err(_) => return,
+                        Err(_) => break,
                     }
                 } else {
                     match wait_event(&rx, idle).await {
                         Waited::Event(event) => *event,
-                        Waited::Closed => return,
+                        Waited::Closed => break,
                         Waited::Idle => {
                             if let Err(error) = self.compact().await {
                                 warn!(%error, "idle compaction failed");
@@ -558,7 +635,7 @@ impl ChatActor {
             idle_compacted = false;
             // Coalesce events that arrived while a turn was in flight —
             // a batch can mix chats, and each event lands in its own
-            // chat's transcript.
+            // chat's IM record.
             while let Ok(event) = rx.try_recv() {
                 self.log_event(&event);
                 batch.push(event);
@@ -567,6 +644,12 @@ impl ChatActor {
                 error!(%error, "turn failed");
             }
         }
+
+        // The event stream ended — the daemon is going down. Give the live
+        // session its one chance to write CONTINUITY.md before the process
+        // dies; a written file releases the session id, a failed one leaves
+        // it for the next run's recovery.
+        self.graceful_close().await;
     }
 
     /// Ask the agent to compact the session's history after a quiet
@@ -632,6 +715,7 @@ impl ChatActor {
         }
 
         self.ensure_ready().await?;
+        self.session_turns += 1;
 
         // Pull every file the events carry into `inbox/` so the agent can
         // open the bytes; image payloads also go into the prompt as `image`
@@ -647,6 +731,16 @@ impl ChatActor {
             }
             if let Some(sticker) = &mut event.sticker {
                 sticker.file = sender.fetch_media(&sticker.file_id, &agent_dir).await?;
+            }
+            // A quoted message's attachments matter just as much — a user
+            // answering "who is this?" about a sticker needs its bytes.
+            if let Some(reply) = &mut event.reply_to {
+                if let Some(media) = &mut reply.media {
+                    media.file = sender.fetch_media(&media.file_id, &agent_dir).await?;
+                }
+                if let Some(sticker) = &mut reply.sticker {
+                    sticker.file = sender.fetch_media(&sticker.file_id, &agent_dir).await?;
+                }
             }
         }
 
@@ -701,17 +795,11 @@ impl ChatActor {
             .prompt_with_nudges(&client, &session_id, prompt.clone(), rx, pending)
             .await
         {
-            // A daemon shutdown must interrupt the prompt wait: dropping the
-            // client, child, and runtime here is what lets a sandbox's Drop
-            // kill the agent process instead of orphaning it.
-            Ok(PromptEnd::Shutdown) => {
-                self.client = None;
-                if let Some(mut child) = self.child.take() {
-                    let _ = child.kill();
-                }
-                self.runtime = None;
-                return Ok(());
-            }
+            // A daemon shutdown interrupts the prompt wait — but the agent
+            // still owes its CONTINUITY.md. Keep client, child, and runtime
+            // alive; the run loop's graceful_close runs the handoff and
+            // owns the teardown.
+            Ok(PromptEnd::Shutdown) => return Ok(()),
             Ok(PromptEnd::Done(result)) => {
                 debug_turn_end(&result);
                 Ok(())
@@ -747,8 +835,10 @@ impl ChatActor {
 
         // The agent asked to be reincarnated this turn (new skills or edited
         // instructions): drop client, process, and runtime — the next event
-        // respawns and `session/load` resumes the session. Drain every
-        // queued request so duplicate calls don't cause repeated restarts.
+        // respawns, and the carried-over session id triggers the recovery
+        // handoff (write CONTINUITY.md, then a fresh session + inject).
+        // Drain every queued request so duplicate calls don't cause
+        // repeated restarts.
         let mut restart = false;
         while self.restart_rx.try_recv().is_ok() {
             restart = true;
@@ -828,7 +918,12 @@ impl ChatActor {
             .await;
             match race {
                 Race::Done(result) => return result.map(PromptEnd::Done),
-                Race::Shutdown => return Ok(PromptEnd::Shutdown),
+                // Cancel before yielding the session: the shutdown handoff
+                // prompt can't run while this turn is still in flight.
+                Race::Shutdown => {
+                    cancel_and_settle(client, session_id, &mut prompt).await;
+                    return Ok(PromptEnd::Shutdown);
+                }
                 Race::EventsClosed => events_open = false,
                 Race::Event(event) => {
                     self.log_event(&event);
@@ -929,18 +1024,28 @@ impl ChatActor {
             "agent initialized"
         );
 
-        // Resume the persisted session when the agent supports it; otherwise
-        // open a fresh one.
-        let session_id = match self.session_id.take() {
-            Some(sid) => match self
-                .restore_session(&client, &init.agent_capabilities, &sid, &cwd)
+        // A carried-over session id means the previous incarnation never
+        // handed off — a crash, a kill, or a handoff that ran out of time.
+        // Restore it only long enough to extract `CONTINUITY.md`, then let
+        // it go: this daemon never resumes a session into active duty, so
+        // the harness or model is free to change between incarnations.
+        if let Some(old) = self.session_id.take()
+            && let Some(sid) = self
+                .restore_session(&client, &init.agent_capabilities, &old, &cwd)
                 .await
-            {
-                Some(sid) => sid,
-                None => self.new_session(&client, &cwd).await?,
-            },
-            None => self.new_session(&client, &cwd).await?,
-        };
+        {
+            if self.write_continuity(&client, &sid).await {
+                info!(session = sid, "recovered continuity from previous session");
+                let _ = self.shared.session_updates.try_send(SessionUpdate::Closed);
+            } else {
+                warn!(
+                    session = sid,
+                    "continuity recovery failed; starting fresh anyway"
+                );
+            }
+        }
+
+        let session_id = self.new_session(&client, &cwd).await?;
 
         if let Err(error) = client
             .set_mode(SessionSetModeParams::new(
@@ -963,8 +1068,15 @@ impl ChatActor {
         }
 
         self.session_id = Some(session_id.clone());
+        self.session_turns = 0;
+        let _ = self
+            .shared
+            .session_updates
+            .try_send(SessionUpdate::Established(session_id.clone()));
+        // Bootstrap memory goes in as the first turn — a plain prompt, so
+        // the same file carries across harnesses and models.
+        self.inject_continuity(&client, &session_id).await;
         self.client = Some(client);
-        let _ = self.shared.session_updates.try_send(session_id);
         Ok(())
     }
 
@@ -1072,6 +1184,133 @@ impl ChatActor {
         let result = client.new_session(SessionNewParams::new(cwd)).await?;
         info!(session = %result.session_id, "session created");
         Ok(result.session_id)
+    }
+
+    /// End the actor: give the live session its one chance to write
+    /// `CONTINUITY.md`, then drop client, process, and runtime. A written
+    /// file means the handoff completed — the session id is reported
+    /// `Closed` so the next spawn starts fresh; a failed handoff leaves
+    /// the id recorded, so the next spawn's recovery retries it.
+    async fn graceful_close(&mut self) {
+        let handed_off = if self.session_id.is_none() {
+            false
+        } else if self.session_turns == 0 {
+            // A session that never ran a turn has nothing to summarize —
+            // and asking it anyway would overwrite a better CONTINUITY.md
+            // (one just recovered into place) with an empty incarnation's
+            // note. It still counts as closed: nothing exists to recover.
+            true
+        } else if let (Some(client), Some(sid)) = (self.client.clone(), self.session_id.clone()) {
+            self.write_continuity(&client, &sid).await
+        } else {
+            false
+        };
+        if handed_off {
+            info!(session = ?self.session_id, "session closed");
+            self.session_id = None;
+            let _ = self.shared.session_updates.try_send(SessionUpdate::Closed);
+        }
+        self.client = None;
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+        }
+        self.runtime = None;
+    }
+
+    /// Ask the session to leave its handoff note: `/compact` first when
+    /// the harness advertises it — the post-compact context is already the
+    /// distilled state the note should carry — then a prompt that writes
+    /// `CONTINUITY.md`. `true` only when the file was (re)written by this
+    /// call; anything less keeps the session resumable for a retry.
+    async fn write_continuity(
+        &self,
+        client: &AcpClient<BotClientHandler>,
+        session_id: &str,
+    ) -> bool {
+        let path = self.cwd().join(CONTINUITY_FILE);
+        let before = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+
+        if self.compact_supported.load(Ordering::Relaxed)
+            && let Err(error) = self
+                .maintenance_prompt(client, session_id, "/compact".to_string())
+                .await
+        {
+            warn!(%error, "handoff compaction failed");
+        }
+        if let Err(error) = self
+            .maintenance_prompt(client, session_id, HANDOFF_PROMPT.to_string())
+            .await
+        {
+            warn!(%error, "handoff prompt failed");
+            return false;
+        }
+        let wrote = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .is_ok_and(|mtime| mtime > before);
+        if !wrote {
+            warn!("agent left no fresh CONTINUITY.md; session stays recoverable");
+        }
+        wrote
+    }
+
+    /// Feed the previous incarnation's `CONTINUITY.md` into a fresh
+    /// session as its first turn. Best-effort: a failed or timed-out
+    /// inject is a memory-less start, not a failed spawn.
+    async fn inject_continuity(&self, client: &AcpClient<BotClientHandler>, session_id: &str) {
+        let Ok(text) = std::fs::read_to_string(self.cwd().join(CONTINUITY_FILE)) else {
+            return;
+        };
+        if text.trim().is_empty() {
+            return;
+        }
+        info!("injecting continuity summary into new session");
+        if let Err(error) = self
+            .maintenance_prompt(client, session_id, format!("{INJECT_PROMPT}\n\n{text}"))
+            .await
+        {
+            warn!(%error, "continuity inject failed");
+        }
+    }
+
+    /// A prompt with no typing, no nudges, and a hard bound — shutdown
+    /// and bootstrap turns must never hang the actor. On timeout the turn
+    /// is cancelled so its wire request cannot bleed into later work.
+    async fn maintenance_prompt(
+        &self,
+        client: &AcpClient<BotClientHandler>,
+        session_id: &str,
+        text: String,
+    ) -> Result<(), ClientError> {
+        let mut prompt: Pin<
+            Box<dyn Future<Output = Result<PromptResult, ClientError>> + Send + '_>,
+        > = Box::pin(client.prompt(PromptParams::new(
+            session_id,
+            vec![ContentBlock::Text(TextContent {
+                text,
+                annotations: None,
+                meta: None,
+            })],
+        )));
+        enum Outcome {
+            Done(Result<PromptResult, ClientError>),
+            TimedOut,
+        }
+        match futures_lite::future::or(async { Outcome::Done(prompt.as_mut().await) }, async {
+            async_io::Timer::after(HANDOFF_TIMEOUT).await;
+            Outcome::TimedOut
+        })
+        .await
+        {
+            Outcome::Done(result) => result.map(|_| ()),
+            Outcome::TimedOut => {
+                cancel_and_settle(client, session_id, &mut prompt).await;
+                Err(ClientError::Transport(format!(
+                    "maintenance prompt timed out after {HANDOFF_TIMEOUT:?}"
+                )))
+            }
+        }
     }
 }
 
@@ -1322,8 +1561,10 @@ const PROTOCOL_DOC: &str = "\
 **Your ordinary text output is invisible.** Everything you write is logged to \
 a transcript file and thrown away — the people in the chat never see it. The \
 ONLY way to communicate is to call a tool on the MCP server named `chat` \
-(the tools appear as `mcp__chat__*`; `mcp_list_tools` with `server_name` = \
-`chat` shows their schemas):
+(on devin the tools appear as `mcp__chat__*` and `mcp_list_tools` with \
+`server_name` = `chat` shows their schemas; on harnesses with a generic \
+MCP dispatcher — Antigravity's `call_mcp_tool` — use `ServerName: \"chat\"` \
+with the tool name below):
 
 - `send_message` `{text, buttons?, chat?}` — post a new message. Every call \
 arrives as one complete, separately-visible message: compose the full \
@@ -1363,15 +1604,17 @@ or when they send a sticker from it. \
 - `save_sticker` `{file_id, name, emoji?, set_name?}` — keep one sticker an \
 event carried under a name you choose, without importing its set. \
 - `list_sticker_sets` `{}` — which sets the library holds. \
-- `history` `{since?, until?, limit?, chat?}` — a chat's transcript: every \
-inbound event and everything you sent there, `ts`/`time`, `dir`, `from`, \
-`text`. Times take epoch seconds, RFC3339, or relative `30m`/`2h`/`7d`; \
-`limit` (default 50) keeps the newest. \
-- `search_history` `{query, since?, until?, limit?, chat?}` — a chat's \
-transcript grepped: case-insensitive match on text, sender name, and \
-command fields. Use these to recall what happened before your context \
-window — \"what did we say about X yesterday\" is a `search_history` call, \
-not a guess. \
+- `history` `{since?, until?, limit?, chat?}` — a chat's IM record: every \
+message the bot saw arrive and everything it sent there, `ts`/`time`, \
+`dir`, `from`, `text`. This is the durable log of what was said — it \
+predates and outlives any session of yours. Times take epoch seconds, \
+RFC3339, or relative `30m`/`2h`/`7d`; `limit` (default 50) keeps the \
+newest. \
+- `search_history` `{query, since?, until?, limit?, chat?}` — the IM \
+record grepped: case-insensitive match on text, sender name, and command \
+fields. When you need to recall what was said — before a restart wiped \
+your context or before you ever existed — this is the tool: \"what did we \
+say about X yesterday\" is a `search_history` call, not a guess. \
 - `chat_info` `{chat}` — look up a chat through your bot identity: \
 numeric id, @username, or t.me link (`t.me/name`, `t.me/c/<id>/<msg>`; \
 invite links cannot resolve). Returns id, type, title, description, \
@@ -1384,7 +1627,8 @@ the bot belongs to: briefly forwards it here to read it, then deletes \
 the copy. `chat` is the SOURCE; a message link supplies `message_id`. \
 Chats the bot isn't in cannot answer — ask the user to add the bot. \
 - `restart` `{}` — reincarnate your process after editing AGENTS.md or \
-adding skills; the session persists.
+adding skills. The next spawn is a FRESH session: anything the next you \
+must remember goes in AGENTS.md or CONTINUITY.md before you call it.
 
 **One session, every chat.** All of the bot's conversations share this one \
 agent: events from every chat arrive here, and `platform` + `chat` on each \
@@ -1396,6 +1640,16 @@ it to reach another conversation: carry a group answer into a DM, check a \
 group's `history` while answering a private question, or post into a chat \
 nobody pinged you in. Cross-chat sends are real sends — do them when the \
 user asked for it or the context makes it obviously right, not on a whim.
+
+**Your context resets; the record doesn't.** Every spawn starts a fresh \
+session — the daemon restarts you on shutdown, `restart`, or a harness \
+swap, and your old context window never comes back. What survives: \
+`CONTINUITY.md` in your working directory (the handoff note the previous \
+you wrote — the daemon asks for it before every clean close, and you may \
+update it any time), everything you keep below the managed block in \
+AGENTS.md, and the IM record the history tools read. When a conversation \
+references something you don't remember, search the record — never guess, \
+never claim it didn't happen.
 
 **Acknowledge first, work second.** Your FIRST action on every event batch \
 must be a `chat` tool call — a short ack like \\\"on it\\\" or \\\"looking\\\", \
@@ -1483,6 +1737,8 @@ ten-second rule above.
 
 Media arrive as `sticker` `{file_id, emoji, set_name, format}` or `media` \
 `{kind, file_id}` — resend them with `send_sticker`/`send_file` `file_id`. \
+A `reply_to` can carry the same `sticker`/`media` shape — what the quoted \
+message held, not just its text. \
 The file also downloads into `inbox/` inside your working directory: \
 `media.file`/`sticker.file` gives `{path, mime}` (e.g. \
 `inbox/CAACAgE….jpg`, `image/jpeg`) — open it with your file tools. \
@@ -1492,7 +1748,8 @@ file is yours: inspect it, extract frames or waveforms with ffmpeg, or \
 transcribe it — whatever the event needs.
 ";
 
-/// `chat slug → session id`, persisted as JSON in `data_dir/sessions.json`.
+/// Sessions awaiting handoff recovery, `slug → session id`, persisted as
+/// JSON in `data_dir/sessions.json`. Empty after a clean shutdown.
 fn load_sessions(data_dir: &Path) -> HashMap<String, String> {
     std::fs::read_to_string(data_dir.join("sessions.json"))
         .ok()
@@ -1502,8 +1759,15 @@ fn load_sessions(data_dir: &Path) -> HashMap<String, String> {
 
 fn save_sessions(data_dir: &Path, sessions: &HashMap<String, String>) {
     match serde_json::to_string_pretty(sessions) {
+        // Write-then-rename: a crash mid-write must not corrupt the only
+        // record the recovery handoff has of the session it should
+        // summarize.
         Ok(text) => {
-            if let Err(error) = std::fs::write(data_dir.join("sessions.json"), text) {
+            let tmp = data_dir.join("sessions.json.tmp");
+            let target = data_dir.join("sessions.json");
+            if let Err(error) =
+                std::fs::write(&tmp, &text).and_then(|()| std::fs::rename(&tmp, &target))
+            {
                 warn!(%error, "failed to persist sessions.json");
             }
         }

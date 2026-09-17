@@ -1,4 +1,4 @@
-//! The per-chat transcript log — `history.jsonl` inside the chat's own
+//! The per-chat IM record — `history.jsonl` inside the chat's own
 //! directory under `data_dir/chats/` (separate from the shared agent's
 //! working directory).
 //!
@@ -6,9 +6,10 @@
 //! excluded) and every outbound action the agent takes is appended as one
 //! JSON object per line, each carrying `ts` (epoch seconds) and `dir`
 //! (`"in"`/`"out"`). The `history` and `search_history` chat tools read it
-//! back so the agent can pull a time range or grep the past — the ACP
-//! session only remembers what fits its context, this file remembers all
-//! of it, and it is *the* record the user can read too.
+//! back so the agent can pull a time range or grep the past. This file is
+//! the durable record of what was said — sessions are disposable and the
+//! ACP context window resets every spawn, so this is *the* memory the
+//! model (and the user) can trust to still be there.
 
 use std::collections::HashSet;
 use std::io::Write as _;

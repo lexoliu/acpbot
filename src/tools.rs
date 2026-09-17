@@ -944,7 +944,7 @@ impl Tool for MessageStatus {
     }
 }
 
-/// The most outbound records a transcript read probes for deletion —
+/// The most outbound records an IM-record read probes for deletion —
 /// keeps a `history` call from turning into an API storm.
 const PROBE_CAP: usize = 8;
 
@@ -1065,7 +1065,7 @@ impl Tool for FetchMessage {
     }
 }
 
-/// Read back a chat's transcript: every inbound event and outbound action,
+/// Read back a chat's IM record: every inbound event and outbound action,
 /// newest `limit` inside the range.
 struct ChatHistory {
     router: Arc<ChatRouter>,
@@ -1076,7 +1076,7 @@ struct ChatHistory {
 struct HistoryArgs {
     #[serde(flatten)]
     range: TimeRangeArgs,
-    /// Whose transcript — the `chat` id from an event, or `platform:id`.
+    /// Whose record — the `chat` id from an event, or `platform:id`.
     /// Omit for the chat the current events came from.
     chat: Option<String>,
 }
@@ -1090,13 +1090,16 @@ impl Tool for ChatHistory {
     }
 
     fn description(&self) -> std::borrow::Cow<'static, str> {
-        "Pull a chat's transcript: every inbound event and everything you sent \
-         there, as JSON records with `ts`/`time`, `dir` (in/out), `from`, `text`. \
-         `since`/`until` accept epoch seconds, RFC3339, or relative `30m`/`2h`/`7d`; \
-         `limit` (default 50) keeps the newest. `chat` selects which chat's \
-         transcript — omit for the chat the current events came from. Use it to \
-         recall what happened before your context window or to answer \"what did \
-         we say about X yesterday\"."
+        "Pull a chat's IM record: every message the bot saw arrive and \
+         everything it sent there, as JSON records with `ts`/`time`, `dir` \
+         (in/out), `from`, `text`. This is the durable log of the \
+         conversation — it predates and outlives your session. \
+         `since`/`until` accept epoch seconds, RFC3339, or relative \
+         `30m`/`2h`/`7d`; `limit` (default 50) keeps the newest. `chat` \
+         selects which chat's record — omit for the chat the current \
+         events came from. Use it to recall what happened before a restart \
+         wiped your context, or to answer \"what did we say about X \
+         yesterday\"."
             .into()
     }
 
@@ -1105,7 +1108,7 @@ impl Tool for ChatHistory {
             Ok(bounds) => bounds,
             Err(msg) => return Ok(ToolResult::error(msg)),
         };
-        let (history, sender) = match self.router.transcript_for(args.chat.as_deref()) {
+        let (history, sender) = match self.router.history_for(args.chat.as_deref()) {
             Ok(target) => target,
             Err(msg) => return Ok(ToolResult::error(msg)),
         };
@@ -1115,7 +1118,7 @@ impl Tool for ChatHistory {
     }
 }
 
-/// Search a chat's transcript for text.
+/// Search a chat's IM record for text.
 struct SearchHistory {
     router: Arc<ChatRouter>,
 }
@@ -1128,7 +1131,7 @@ struct SearchHistoryArgs {
     query: String,
     #[serde(flatten)]
     range: TimeRangeArgs,
-    /// Whose transcript — the `chat` id from an event, or `platform:id`.
+    /// Whose record — the `chat` id from an event, or `platform:id`.
     /// Omit for the chat the current events came from.
     chat: Option<String>,
 }
@@ -1142,11 +1145,12 @@ impl Tool for SearchHistory {
     }
 
     fn description(&self) -> std::borrow::Cow<'static, str> {
-        "Search a chat's transcript — case-insensitive match on message text, \
-         sender name, and command fields. Same `since`/`until`/`limit` as \
-         `history`; `chat` selects which chat (default: the one the current \
-         events came from). The fastest way to answer \"when did X mention Y\" \
-         or \"did I already reply to that\"."
+        "Search a chat's IM record — case-insensitive match on message text, \
+         sender name, and command fields, over the durable log of what was \
+         actually said. Same `since`/`until`/`limit` as `history`; `chat` \
+         selects which chat (default: the one the current events came \
+         from). The fastest way to answer \"when did X mention Y\" or \
+         \"did I already reply to that\"."
             .into()
     }
 
@@ -1155,7 +1159,7 @@ impl Tool for SearchHistory {
             Ok(bounds) => bounds,
             Err(msg) => return Ok(ToolResult::error(msg)),
         };
-        let (history, sender) = match self.router.transcript_for(args.chat.as_deref()) {
+        let (history, sender) = match self.router.history_for(args.chat.as_deref()) {
             Ok(target) => target,
             Err(msg) => return Ok(ToolResult::error(msg)),
         };
@@ -1188,7 +1192,7 @@ mod tests {
 
     /// The parts a test may care about: the toolset, the router behind it,
     /// the senders' recorded calls, the chat keys senders were bound to,
-    /// the restart signal, and the test chat's transcript.
+    /// the restart signal, and the test chat's IM record.
     type Fixture = (
         Tools,
         Arc<ChatRouter>,
@@ -1323,7 +1327,7 @@ mod tests {
         );
     }
 
-    /// `history`/`search_history` read the transcript the sender writes —
+    /// `history`/`search_history` read the IM record the sender writes —
     /// a send lands in `history.jsonl` as an `out` record immediately.
     #[test]
     fn history_reads_back_outbound() {
@@ -1537,7 +1541,7 @@ mod tests {
         let result = block("send_message", "{\"text\":\"x\",\"chat\":\"discord:9\"}");
         assert!(result.is_error());
 
-        // `history` follows `chat` too: send into "7", read its transcript.
+        // `history` follows `chat` too: send into "7", read its record.
         let text = block("history", "{\"chat\":\"7\"}")
             .as_text()
             .unwrap()

@@ -238,6 +238,9 @@ fn extract_cli(data: &CliContextData, mut event: ChatEvent) -> ChatEvent {
                 message_id: replied.message_id,
                 from: replied.from.clone(),
                 text: replied.text.clone(),
+                // The CLI wire ref carries no attachment detail.
+                sticker: None,
+                media: None,
             });
             event.media = message.files.first().map(|file| EventMedia {
                 kind: match file.kind.as_str() {
@@ -334,13 +337,11 @@ fn extract_discord_message(
                 .unwrap_or_else(|| m.author.username.clone()),
         ),
         text: (!m.content.is_empty()).then(|| m.content.clone()),
+        sticker: None,
+        media: m.attachments.first().map(discord_event_media),
     });
     // `file_id` carries the attachment's CDN URL; `fetch_media` downloads it.
-    event.media = message.attachments.first().map(|a| EventMedia {
-        kind: discord_media_kind(a),
-        file_id: a.url.clone(),
-        file: None,
-    });
+    event.media = message.attachments.first().map(discord_event_media);
     event
 }
 
@@ -411,6 +412,15 @@ fn discord_attention(message: &botkit_discord::Message, me: &Identity) -> &'stat
     }
 }
 
+/// A Discord attachment as `EventMedia` — `file_id` carries the CDN URL.
+fn discord_event_media(attachment: &botkit_discord::Attachment) -> EventMedia {
+    EventMedia {
+        kind: discord_media_kind(attachment),
+        file_id: attachment.url.clone(),
+        file: None,
+    }
+}
+
 /// The event-schema media kind a Discord attachment's content type implies.
 fn discord_media_kind(attachment: &botkit_discord::Attachment) -> &'static str {
     match attachment
@@ -478,45 +488,11 @@ fn extract_telegram(
                         .as_ref()
                         .map(|u| u.username.clone().unwrap_or_else(|| u.first_name.clone())),
                     text: replied.text.clone(),
+                    sticker: replied.sticker.as_ref().map(event_sticker),
+                    media: event_media(replied),
                 });
-            event.sticker = message.sticker.as_ref().map(|s| EventSticker {
-                file_id: s.file_id.clone(),
-                emoji: s.emoji.clone(),
-                set_name: s.set_name.clone(),
-                format: if s.is_animated {
-                    "animated"
-                } else if s.is_video {
-                    "video"
-                } else {
-                    "static"
-                },
-                file: None,
-            });
-            event.media = message
-                .video
-                .as_ref()
-                .map(|f| ("video", &f.file_id))
-                .or_else(|| message.audio.as_ref().map(|f| ("audio", &f.file_id)))
-                .or_else(|| message.voice.as_ref().map(|f| ("voice", &f.file_id)))
-                .or_else(|| message.document.as_ref().map(|f| ("document", &f.file_id)))
-                .or_else(|| {
-                    message
-                        .animation
-                        .as_ref()
-                        .map(|f| ("animation", &f.file_id))
-                })
-                .or_else(|| {
-                    message
-                        .photo
-                        .as_ref()
-                        .and_then(|sizes| sizes.last())
-                        .map(|p| ("photo", &p.file_id))
-                })
-                .map(|(kind, file_id)| EventMedia {
-                    kind,
-                    file_id: file_id.clone(),
-                    file: None,
-                });
+            event.sticker = message.sticker.as_ref().map(event_sticker);
+            event.media = event_media(message);
         }
         UpdateKind::CallbackQuery(query) => {
             event.kind = "button";
@@ -555,6 +531,54 @@ fn extract_telegram(
         UpdateKind::Unknown => return extract_generic(ctx, event),
     }
     event
+}
+
+/// Map a Telegram `Sticker` to the event's sticker shape — also used for
+/// stickers riding on a `reply_to` message.
+fn event_sticker(s: &botkit_telegram::Sticker) -> EventSticker {
+    EventSticker {
+        file_id: s.file_id.clone(),
+        emoji: s.emoji.clone(),
+        set_name: s.set_name.clone(),
+        format: if s.is_animated {
+            "animated"
+        } else if s.is_video {
+            "video"
+        } else {
+            "static"
+        },
+        file: None,
+    }
+}
+
+/// The message's first media attachment, in the same priority order for
+/// top-level and `reply_to` messages.
+fn event_media(message: &botkit_telegram::Message) -> Option<EventMedia> {
+    message
+        .video
+        .as_ref()
+        .map(|f| ("video", &f.file_id))
+        .or_else(|| message.audio.as_ref().map(|f| ("audio", &f.file_id)))
+        .or_else(|| message.voice.as_ref().map(|f| ("voice", &f.file_id)))
+        .or_else(|| message.document.as_ref().map(|f| ("document", &f.file_id)))
+        .or_else(|| {
+            message
+                .animation
+                .as_ref()
+                .map(|f| ("animation", &f.file_id))
+        })
+        .or_else(|| {
+            message
+                .photo
+                .as_ref()
+                .and_then(|sizes| sizes.last())
+                .map(|p| ("photo", &p.file_id))
+        })
+        .map(|(kind, file_id)| EventMedia {
+            kind,
+            file_id: file_id.clone(),
+            file: None,
+        })
 }
 
 /// A compact label for a reaction: the emoji itself, `custom:<id>` for

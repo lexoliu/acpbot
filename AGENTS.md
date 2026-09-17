@@ -32,9 +32,13 @@ must do the same (see `ensure_executor` in test modules).
 - `chat.rs` — `ChatEvent`, the JSON schema the agent sees; it is documented
   again in the agent's `AGENTS.md` managed block, so the two never drift.
 - `agent.rs` — `Dispatcher` + the single shared `ChatActor` + `ChatRouter`:
-  spawns the ACP process, restores the session (`session/resume` →
-  `session/load` → `session/new`), forwards event batches as prompts, runs
-  the first-reply watchdog and the idle-compaction timer. The router maps
+  spawns the ACP process, always opens a *fresh* session (`session/new`)
+  and injects the previous incarnation's `CONTINUITY.md` as the bootstrap
+  prompt; before a clean close it asks the agent to (re)write that file.
+  A session id in `sessions.json` is a "died before handoff" marker — the
+  next spawn restores it only to extract the summary, never to resume.
+  Forwards event batches as prompts, runs the first-reply watchdog and
+  the idle-compaction timer. The router maps
   `ChatKey` → per-chat `Sender`/`History`/topic cell and tracks the
   turn's triggering chat, which tools' optional `chat` argument defaults to.
 - `sender.rs` — `Platform` enum (`Telegram`, `Discord`, `Cli`, test `Record`):
@@ -47,9 +51,19 @@ must do the same (see `ensure_executor` in test modules).
   records, never as an inbound event.
 - `mcpserver.rs`, `bridge.rs`, `sandbox.rs` — the chat-tools MCP endpoint and
   the isolation runtimes (`native` heel, `docker`, `bare`).
-- `history.rs` — `history.jsonl` per chat: inbound events appended by the
-  actor, outbound actions by `Sender`, read back by the `history` and
-  `search_history` tools (epoch/RFC3339/`30m`-style `since`/`until`).
+- `agy.rs` — `acpbot agy-bridge`: an ACP server over stdio that fronts the
+  Antigravity `agy` CLI (`[agent] command = "<acpbot>", args = ["agy-bridge"]`).
+  agy runs one `stream-json` process per turn; the bridge threads its
+  `conversation_id` via `--conversation` and persists the `acp session id →
+  conversation id` map at `<cwd>/.agy-bridge.json` so `session/load` can
+  still recover a session for the continuity handoff. Chat tools reach agy
+  through its global `~/.gemini/config/mcp_config.json`, mirrored from the
+  session's `.devin/mcp_config.json`. Requires `isolation.kind = "none"`.
+- `history.rs` — `history.jsonl` per chat: the durable IM record, not an
+  agent transcript — inbound events appended by the actor, outbound actions
+  by `Sender`, read back by the `history` and `search_history` tools
+  (epoch/RFC3339/`30m`-style `since`/`until`). It outlives sessions by
+  design; the ACP session context is disposable.
 - `stickers.rs`, `stickerset.rs` — the agent-evolvable sticker pack and its
   Telegram sticker-set publishing.
 - `stickerlib.rs` — the persistent catalog of foreign sticker sets

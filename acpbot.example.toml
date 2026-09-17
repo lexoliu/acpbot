@@ -83,6 +83,16 @@ kind = "native"
 # [agent.isolation]
 # kind = "none"
 
+# Antigravity instead of devin: `agy-bridge` is an ACP server inside this
+# binary that spawns `agy` per turn and threads its conversation id across
+# them. It needs `kind = "none"` — the sandbox would block agy's own
+# ~/.gemini state — and `AGY_BIN` overrides the executable looked up.
+# command = "/absolute/path/to/acpbot"
+# args = ["agy-bridge"]
+# model = "gemini-3.8-flash-low"
+# [agent.isolation]
+# kind = "none"
+
 # Optional persona prepended to the shared agent's generated AGENTS.md.
 # persona = "You are a cheerful participant in this group."
 

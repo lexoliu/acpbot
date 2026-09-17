@@ -207,6 +207,9 @@ pub enum BridgeError {
     /// An IPC call to a daemon command failed.
     #[error("ipc call to {0} failed: {1}")]
     IpcCall(String, heel::IpcError),
+    /// The ACP stdio transport the `agy-bridge` serves failed.
+    #[error("acp stdio transport: {0}")]
+    AcpTransport(#[from] aither_mcp::protocol::McpError),
     /// A bare-path target on a platform without unix sockets.
     #[cfg(windows)]
     #[error(
