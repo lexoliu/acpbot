@@ -17,7 +17,7 @@ pub struct Config {
     /// Filesystem locations.
     #[serde(default)]
     pub paths: PathsConfig,
-    /// Optional persona text injected into every chat's `AGENTS.md`.
+    /// Optional persona text injected into the shared `AGENTS.md`.
     pub persona: Option<String>,
 }
 

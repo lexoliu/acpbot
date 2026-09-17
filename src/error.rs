@@ -204,7 +204,7 @@ pub enum BridgeError {
     UnsupportedTarget(String),
 }
 
-/// The per-chat MCP socket listener failed.
+/// The chat MCP endpoint listener failed.
 #[derive(Debug, thiserror::Error)]
 pub enum McpServerError {
     /// The unix socket could not be bound.
@@ -243,7 +243,7 @@ pub enum MainError {
     Usage(String),
 }
 
-/// A per-chat actor operation failed.
+/// A shared-actor operation failed.
 #[derive(Debug, thiserror::Error)]
 pub enum AgentError {
     /// The ACP client call failed.

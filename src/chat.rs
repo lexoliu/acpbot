@@ -6,8 +6,10 @@ use serde::Serialize;
 
 /// Identifies one conversation on one platform.
 ///
-/// Used as the map key for per-chat actors and, via [`ChatKey::slug`], as the
-/// filesystem name for the chat's working directory and IPC socket.
+/// Used as the map key for per-chat senders, transcripts, and topic cells
+/// in the [`ChatRouter`](crate::agent::ChatRouter) and, via
+/// [`ChatKey::slug`], as the filesystem name for the chat's transcript
+/// directory.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ChatKey {
     /// Platform tag (`telegram`, `discord`, `matrix`).
@@ -130,8 +132,8 @@ pub struct EventReaction {
 
 /// One chat event, serialized to JSON and handed to the agent as the prompt.
 ///
-/// The schema is the agent's whole view of the chat: it is documented again in
-/// the per-chat `AGENTS.md` so the two never drift.
+/// The schema is the agent's whole view of every chat: it is documented
+/// again in the shared `AGENTS.md` so the two never drift.
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatEvent {
     /// `message`, `command`, `button`, `reaction`, `edited`, or `nudge`

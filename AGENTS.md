@@ -3,9 +3,10 @@
 A chat bot driven by an ACP agent. `acpbot run` starts the daemon: a botkit
 platform adapter (Telegram, Discord, or the `botkit-cli` JSONL backend) turns
 every chat
-event into an ACP `session/prompt` to a per-chat agent process (default
-`devin acp`), and the agent speaks back through `chat` MCP tools served by the
-same binary. `acpbot mcp-bridge` is the stdio↔socket link the agent spawns.
+event into an ACP `session/prompt` to one shared agent process (default
+`devin acp`) — every conversation feeds the same context window — and the
+agent speaks back through `chat` MCP tools served by the same binary.
+`acpbot mcp-bridge` is the stdio↔socket link the agent spawns.
 
 ## Build, test, run
 
@@ -29,11 +30,13 @@ must do the same (see `ensure_executor` in test modules).
   `"ambient"` (room chatter the agent may still answer). Needs the bot's own
   identity — `getMe`/`GET /users/@me` — fetched once at startup.
 - `chat.rs` — `ChatEvent`, the JSON schema the agent sees; it is documented
-  again in the per-chat `AGENTS.md` managed block, so the two never drift.
-- `agent.rs` — `Dispatcher` + per-chat `ChatActor`: spawns the ACP process,
-  restores sessions (`session/resume` → `session/load` → `session/new`),
-  forwards event batches as prompts, runs the first-reply watchdog and the
-  idle-compaction timer.
+  again in the agent's `AGENTS.md` managed block, so the two never drift.
+- `agent.rs` — `Dispatcher` + the single shared `ChatActor` + `ChatRouter`:
+  spawns the ACP process, restores the session (`session/resume` →
+  `session/load` → `session/new`), forwards event batches as prompts, runs
+  the first-reply watchdog and the idle-compaction timer. The router maps
+  `ChatKey` → per-chat `Sender`/`History`/topic cell and tracks the
+  turn's triggering chat, which tools' optional `chat` argument defaults to.
 - `sender.rs` — `Platform` enum (`Telegram`, `Discord`, `Cli`, test `Record`):
   every
   outbound tool call lands here. `probe_message` checks whether a message

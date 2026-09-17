@@ -2,23 +2,26 @@
 
 A chat bot driven by an ACP agent. `acpbot run` starts the daemon: a
 botkit platform adapter (Telegram or the `botkit-cli` JSONL backend) turns
-every chat event into an ACP `session/prompt` to a per-chat agent process
-(`devin acp` by default — any ACP harness works), and the agent speaks
-back through `chat` MCP tools served by the same binary.
+every chat event into an ACP `session/prompt` to one shared agent process
+(`devin acp` by default — any ACP harness works) — every conversation
+feeds the same context window — and the agent speaks back through `chat`
+MCP tools served by the same binary.
 
 ## How it works
 
-- Every inbound chat event is forwarded as an ACP prompt to an agent
-  process scoped to that chat; the agent's only way to speak is through
+- Every inbound chat event is forwarded as an ACP prompt to the one shared
+  agent process and session; the agent's only way to speak is through
   chat tools (`send_message`, `reply`, `send_file`, `send_sticker`,
   `react`, `edit_message`, `delete_message`, `pin_message`,
   `message_status`, `history`, `search_history`, sticker-set tools,
-  `restart`).
+  `restart`). Chat-bound tools take an optional `chat` argument — a bare
+  chat id or `platform:id`; omitted, a call lands in the chat whose
+  events triggered the current turn.
 - Telegram support covers native stickers (including importing foreign
   sticker sets), reactions, edits, deletes, pins, inline keyboards, forum
   topics, and group attention classification (`direct` vs `ambient`).
 - Media flows both ways: inbound files download into `inbox/` inside the
-  chat's working directory; outbound `send_file` maps MIME types to the
+  agent's working directory; outbound `send_file` maps MIME types to the
   right Telegram media kind.
 - The agent can evolve itself: it owns everything below the managed block
   of its `AGENTS.md`, can add `.devin/skills/`, can extend its sticker

@@ -48,7 +48,7 @@ struct State {
 }
 
 /// The shared sticker catalog. Construct once per daemon and clone the
-/// `Arc` into every chat's tool set.
+/// `Arc` into the shared tool set.
 pub struct StickerLibrary {
     path: PathBuf,
     /// `None` on the CLI platform — imports need the Telegram API, while

@@ -1,10 +1,10 @@
 //! acpbot — a chat bot driven by an ACP agent.
 //!
 //! `acpbot run` starts the daemon: botkit platform adapters turn every chat
-//! event into an ACP `session/prompt` to a per-chat agent process (default
-//! `devin acp`), and the agent speaks back through `chat` MCP tools served by
-//! this same binary (`acpbot mcp-bridge` is the stdio↔socket link the agent
-//! spawns).
+//! event into an ACP `session/prompt` to one shared agent process (default
+//! `devin acp`) — every conversation feeds the same context window — and the
+//! agent speaks back through `chat` MCP tools served by this same binary
+//! (`acpbot mcp-bridge` is the stdio↔socket link the agent spawns).
 
 mod agent;
 mod bot;
@@ -210,7 +210,7 @@ fn run(config_path: &Path) -> Result<(), MainError> {
         sticker_library,
     );
     // Kept, not detached: on shutdown the dispatcher's drop chain is what
-    // kills every chat's agent process (a heel sandbox kills on drop).
+    // kills the shared agent process (a heel sandbox kills on drop).
     let dispatcher_task = executor_core::spawn(dispatcher.run(events_rx));
 
     ctrlc::set_handler(move || signal.shutdown()).expect("install Ctrl-C handler");
@@ -219,9 +219,9 @@ fn run(config_path: &Path) -> Result<(), MainError> {
     futures_lite::future::block_on(executor.run(bot_run)).map_err(MainError::Bot)?;
 
     // The bot is stopped; closing the last event sender ends the dispatcher,
-    // which waits for every chat actor (and its sandbox) to finish.
+    // which waits for the shared actor (and its sandbox) to finish.
     drop(events_tx);
-    info!("shutting down agents");
+    info!("shutting down agent");
     futures_lite::future::block_on(executor.run(dispatcher_task));
     Ok(())
 }
