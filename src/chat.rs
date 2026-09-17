@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Identifies one conversation on one platform.
 ///
@@ -13,7 +13,7 @@ use serde::Serialize;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ChatKey {
     /// Platform tag (`telegram`, `discord`, `matrix`).
-    pub platform: &'static str,
+    pub platform: String,
     /// Platform-native chat/channel id.
     pub id: String,
 }
@@ -43,7 +43,7 @@ impl fmt::Display for ChatKey {
 }
 
 /// Who triggered an event.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventSender {
     /// Platform-native user id.
     pub id: String,
@@ -52,7 +52,7 @@ pub struct EventSender {
 }
 
 /// The message a `reply` event was answering, when the platform tells us.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventReplyRef {
     /// Id of the referenced message.
     pub message_id: i64,
@@ -73,7 +73,7 @@ pub struct EventReplyRef {
 }
 
 /// Command details for `type == "command"`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventCommand {
     /// Command name without prefix (`start` for `/start`).
     pub name: String,
@@ -84,7 +84,7 @@ pub struct EventCommand {
 
 /// A sticker attached to an inbound message — enough for the agent to
 /// recognize it and resend it via `send_sticker`'s `file_id`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventSticker {
     /// Telegram `file_id` — resendable.
     pub file_id: String,
@@ -95,7 +95,7 @@ pub struct EventSticker {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub set_name: Option<String>,
     /// `animated` (.tgs), `video` (.webm), or `static`.
-    pub format: &'static str,
+    pub format: String,
     /// Local copy of the file under `<chat dir>/inbox/`, when the download
     /// succeeded.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -106,7 +106,7 @@ pub struct EventSticker {
 /// absolute so every harness's file tools resolve it the same way
 /// (relative paths land wherever the harness defaults — agy's scratch
 /// dir, not the session cwd); `mime` is guessed from the downloaded name.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventFile {
     /// Absolute path (`<chat dir>/inbox/<file_unique_id>.<ext>`).
     pub path: String,
@@ -116,10 +116,10 @@ pub struct EventFile {
 
 /// Non-sticker media attached to an inbound message. `file_id` resends it
 /// via `send_file`; `file` points at a local copy when it downloaded.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventMedia {
     /// `photo`, `video`, `audio`, `voice`, `document`, or `animation`.
-    pub kind: &'static str,
+    pub kind: String,
     /// Telegram `file_id` — resendable via `send_file`.
     pub file_id: String,
     /// Local copy of the file under `<chat dir>/inbox/`, when the download
@@ -130,7 +130,7 @@ pub struct EventMedia {
 
 /// A reaction change on a message (`type == "reaction"`): what the user
 /// added and removed.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventReaction {
     /// Reactions now present (emoji strings; custom emoji appear as
     /// `custom:<id>`).
@@ -143,15 +143,15 @@ pub struct EventReaction {
 ///
 /// The schema is the agent's whole view of every chat: it is documented
 /// again in the shared `AGENTS.md` so the two never drift.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatEvent {
     /// `message`, `command`, `button`, `reaction`, `edited`, or `nudge`
     /// (the daemon's silence interrupt — the only kind that isn't a real
     /// platform event).
     #[serde(rename = "type")]
-    pub kind: &'static str,
+    pub kind: String,
     /// Platform tag.
-    pub platform: &'static str,
+    pub platform: String,
     /// Chat the event belongs to.
     pub chat: String,
     /// Event time, epoch seconds — the platform's message/edit/reaction
@@ -161,11 +161,11 @@ pub struct ChatEvent {
     /// reply to a bot message, @-mention, command, button press) or
     /// `"ambient"` (group chatter forwarded for context — answer only when
     /// it continues a conversation the bot is in or clearly concerns it).
-    pub attention: &'static str,
+    pub attention: String,
     /// The chat's shape on the platform — `private`, `group`, `supergroup`,
     /// or `channel` — when the platform reports it.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub chat_type: Option<&'static str>,
+    pub chat_type: Option<String>,
     /// The chat's title, when the platform reports it (Telegram groups and
     /// channels carry one; DMs, Discord messages, and the CLI do not).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -266,12 +266,12 @@ mod tests {
     #[test]
     fn sticker_and_media_serialize() {
         let base = ChatEvent {
-            kind: "message",
-            platform: "telegram",
+            kind: "message".into(),
+            platform: "telegram".into(),
             chat: "1".to_string(),
             ts: 1700000000,
-            attention: "direct",
-            chat_type: Some("private"),
+            attention: "direct".into(),
+            chat_type: Some("private".into()),
             chat_title: None,
             message_id: Some(9),
             from: EventSender {
@@ -286,7 +286,7 @@ mod tests {
                 file_id: "CAACAgE".to_string(),
                 emoji: Some("😂".to_string()),
                 set_name: Some("pack_by_bot".to_string()),
-                format: "static",
+                format: "static".into(),
                 file: Some(EventFile {
                     path: "/data/chats/shared/inbox/CAACAgE.webp".to_string(),
                     mime: "image/webp".to_string(),
@@ -310,7 +310,7 @@ mod tests {
         let with_media = ChatEvent {
             sticker: None,
             media: Some(EventMedia {
-                kind: "video",
+                kind: "video".into(),
                 file_id: "BAADBQ".to_string(),
                 file: None,
             }),
@@ -327,7 +327,7 @@ mod tests {
         assert_eq!(with_media.files().count(), 0);
 
         let reacted = ChatEvent {
-            kind: "reaction",
+            kind: "reaction".into(),
             sticker: None,
             reaction: Some(EventReaction {
                 added: vec!["👍".to_string()],
@@ -341,17 +341,60 @@ mod tests {
         assert!(json.contains("\"removed\":[\"custom:99\"]"), "{json}");
     }
 
+    /// Events deserialize back from their prompt JSON — the in-flight
+    /// journal's restart replay depends on the round-trip.
+    #[test]
+    fn event_json_roundtrips() {
+        let event = ChatEvent {
+            kind: "message".into(),
+            platform: "telegram".into(),
+            chat: "1".to_string(),
+            ts: 1700000000,
+            attention: "direct".into(),
+            chat_type: Some("private".into()),
+            chat_title: Some("room".to_string()),
+            message_id: Some(9),
+            from: EventSender {
+                id: "7".to_string(),
+                name: "Ada".to_string(),
+            },
+            text: Some("hi".to_string()),
+            command: None,
+            button: None,
+            reply_to: Some(EventReplyRef {
+                message_id: 3,
+                from: Some("Bo".to_string()),
+                text: Some("earlier".to_string()),
+                sticker: None,
+                media: Some(EventMedia {
+                    kind: "photo".into(),
+                    file_id: "fid".to_string(),
+                    file: None,
+                }),
+            }),
+            sticker: None,
+            media: None,
+            reaction: None,
+            thread_id: Some(12),
+        };
+        let text = event.to_prompt_text();
+        let back: ChatEvent = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.to_prompt_text(), text);
+        assert_eq!(back.kind, "message");
+        assert_eq!(back.chat_type.as_deref(), Some("private"));
+    }
+
     /// `/stop` commands and bare "stop" texts halt a turn; other events —
     /// even ones containing the word — do not.
     #[test]
     fn is_stop_marks_only_real_stops() {
         let base = ChatEvent {
-            kind: "message",
-            platform: "telegram",
+            kind: "message".into(),
+            platform: "telegram".into(),
             chat: "1".to_string(),
             ts: 1700000000,
-            attention: "ambient",
-            chat_type: Some("supergroup"),
+            attention: "ambient".into(),
+            chat_type: Some("supergroup".into()),
             chat_title: None,
             message_id: Some(9),
             from: EventSender {
@@ -377,8 +420,8 @@ mod tests {
         );
         assert!(
             ChatEvent {
-                kind: "command",
-                attention: "direct",
+                kind: "command".into(),
+                attention: "direct".into(),
                 text: None,
                 command: Some(EventCommand {
                     name: "stop".to_string(),
@@ -391,8 +434,8 @@ mod tests {
         // …but only when the command is aimed at this bot.
         assert!(
             !ChatEvent {
-                kind: "command",
-                attention: "ambient",
+                kind: "command".into(),
+                attention: "ambient".into(),
                 text: None,
                 command: Some(EventCommand {
                     name: "stop".to_string(),

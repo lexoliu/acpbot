@@ -30,6 +30,7 @@ use aither_acp::{
 };
 use async_channel::{Receiver, Sender as ChanSender};
 use base64::Engine as _;
+use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, warn};
 
 use crate::chat::{ChatEvent, ChatKey};
@@ -146,7 +147,7 @@ quietly — no `chat` tool calls, nobody is waiting — then end the turn.";
 /// The [`ChatKey`] an event belongs to.
 fn key_of(event: &ChatEvent) -> ChatKey {
     ChatKey {
-        platform: event.platform,
+        platform: event.platform.clone(),
         id: event.chat.clone(),
     }
 }
@@ -320,7 +321,7 @@ impl ChatRouter {
                     return Err(format!("missing chat id in {raw:?}"));
                 }
                 Ok(ChatKey {
-                    platform: self.platform,
+                    platform: self.platform.to_string(),
                     id: id.to_string(),
                 })
             }
@@ -518,6 +519,7 @@ impl Dispatcher {
             child: None,
             prompt_caps: PromptCapabilities::default(),
             compact_supported: Arc::new(AtomicBool::new(false)),
+            inflight: load_inflight(&self.shared.data_dir),
             session_turns: 0,
             spoke_rx,
             blocked_rx,
@@ -621,6 +623,11 @@ struct ChatActor {
     /// harness handles a `compact` command, so idle compaction is a local
     /// operation rather than text the model would answer in the chat.
     compact_supported: Arc<AtomicBool>,
+    /// Events dispatched to a turn whose completion was never confirmed —
+    /// the batch in `sent`, mid-turn coalesced events in `queued`.
+    /// Mirrored to `data_dir/inflight.json` on every change so a restart
+    /// replays whatever the agent never finished.
+    inflight: Inflight,
     /// Turns the current session has run. `0` means a fresh session with
     /// nothing to summarize — a handoff then would only overwrite a better
     /// `CONTINUITY.md` with a thin one, so `graceful_close` skips it.
@@ -675,6 +682,11 @@ impl ChatActor {
         self.router.history(&key_of(event)).append_event(event);
     }
 
+    /// Mirror the in-flight journal to `data_dir/inflight.json`.
+    fn persist_inflight(&self) {
+        save_inflight(&self.shared.data_dir, &self.inflight);
+    }
+
     async fn run(mut self, rx: Receiver<ChatEvent>) {
         // Spawned at daemon start: bring the process, ACP session, and
         // continuity inject up before the first event so its turn only
@@ -689,11 +701,29 @@ impl ChatActor {
         let mut idle_compacted = false;
         let idle = self.shared.agent.idle_compact();
         // Events the in-flight turn pulled off `rx` but didn't consume —
-        // they seed the next batch so ordering stays FIFO.
+        // they seed the next batch so ordering stays FIFO. A previous
+        // incarnation's journal seeds it first: those events were already
+        // logged to IM history when they were pulled, so they rejoin the
+        // queue without another `log_event`. `replayed` counts how many
+        // leading queue events were already dispatched once — the turn
+        // tags them so the agent checks history before re-answering.
         let mut pending: Vec<ChatEvent> = Vec::new();
+        let mut replayed = self.inflight.sent.len();
+        // Clone, don't drain: `inflight` mirrors the journal file until the
+        // next `persist_inflight`, so the queue re-seeds while the file
+        // still covers every journaled event.
+        pending.extend(self.inflight.sent.iter().cloned());
+        pending.extend(self.inflight.queued.iter().cloned());
+        // `true` after a turn errored: its batch went back to `pending`,
+        // but a persistently failing turn must wait for a fresh event
+        // before re-dispatching instead of spinning.
+        let mut await_fresh = false;
         loop {
-            let mut batch = std::mem::take(&mut pending);
-            if batch.is_empty() {
+            // Wait for the next event when the queue is empty, or while a
+            // failed turn's re-dispatch is holding for fresh input —
+            // `pending` stays queued through the wait so an idle
+            // compaction or a closed channel never strands it.
+            if pending.is_empty() || await_fresh {
                 let first = if idle_compacted || idle.is_zero() {
                     match rx.recv().await {
                         Ok(event) => event,
@@ -713,7 +743,10 @@ impl ChatActor {
                     }
                 };
                 self.log_event(&first);
-                batch.push(first);
+                self.inflight.queued.push(first.clone());
+                self.persist_inflight();
+                pending.push(first);
+                await_fresh = false;
             }
             idle_compacted = false;
             // Coalesce events that arrived while a turn was in flight —
@@ -721,10 +754,29 @@ impl ChatActor {
             // chat's IM record.
             while let Ok(event) = rx.try_recv() {
                 self.log_event(&event);
-                batch.push(event);
+                self.inflight.queued.push(event.clone());
+                pending.push(event);
             }
-            if let Err(error) = self.turn(&batch, &rx, &mut pending).await {
+            self.persist_inflight();
+            let batch = std::mem::take(&mut pending);
+            // Everything queued becomes this dispatch's `sent` — journaled
+            // before the prompt runs, so a restart mid-turn replays the
+            // exact batch instead of losing it. Events are durable in IM
+            // history already; the journal adds "dispatched but never
+            // confirmed".
+            self.inflight.sent.clone_from(&batch);
+            self.inflight.queued.clear();
+            self.persist_inflight();
+            if let Err(error) = self.turn(&batch, replayed, &rx, &mut pending).await {
                 error!(%error, "turn failed");
+                // The batch never confirmed — back to the head of the
+                // queue (the journal already holds it), then wait for a
+                // fresh event so a persistent failure can't spin.
+                replayed = batch.len();
+                pending.splice(0..0, batch);
+                await_fresh = true;
+            } else {
+                replayed = 0;
             }
         }
 
@@ -777,9 +829,15 @@ impl ChatActor {
     /// `rx` stays wired into the prompt wait so a `stop` event can cancel
     /// the turn mid-flight; non-stop events pulled that way land in
     /// `pending` and seed the caller's next batch.
+    ///
+    /// `replayed` counts the batch's leading events a previous dispatch
+    /// already sent once — journaled events re-delivered after a crash,
+    /// shutdown, or failed turn — so the prompt flags them: the model may
+    /// have partly answered them and should check `history` first.
     async fn turn(
         &mut self,
         batch: &[ChatEvent],
+        replayed: usize,
         rx: &Receiver<ChatEvent>,
         pending: &mut Vec<ChatEvent>,
     ) -> Result<(), AgentError> {
@@ -832,11 +890,23 @@ impl ChatActor {
         } else {
             serde_json::to_string(&batch).expect("events serialize")
         };
-        let mut prompt = vec![ContentBlock::Text(TextContent {
+        let mut prompt = Vec::new();
+        if replayed > 0 {
+            prompt.push(ContentBlock::Text(TextContent {
+                text: format!(
+                    "[acpbot] the daemon restarted mid-turn — the first {replayed} \
+                     event(s) below already reached you before the interruption and \
+                     may be partly answered; check `history` before re-answering."
+                ),
+                annotations: None,
+                meta: None,
+            }));
+        }
+        prompt.push(ContentBlock::Text(TextContent {
             text,
             annotations: None,
             meta: None,
-        })];
+        }));
         for file in batch.iter().flat_map(ChatEvent::files) {
             let is_image = self.prompt_caps.image && file.mime.starts_with("image/");
             let is_audio = self.prompt_caps.audio && file.mime.starts_with("audio/");
@@ -966,6 +1036,13 @@ impl ChatActor {
             }
         }
 
+        // The batch is confirmed delivered — its events leave the journal;
+        // only events coalesced into `pending` during the turn remain
+        // unconfirmed. Shutdown/error returns above keep the file intact.
+        self.inflight.sent.clear();
+        self.inflight.queued.clone_from(pending);
+        self.persist_inflight();
+
         let outcome = match end {
             PromptEnd::Done(_) | PromptEnd::Stopped | PromptEnd::Blocked(_) => Ok(()),
             PromptEnd::Shutdown => unreachable!("shutdown returns above"),
@@ -1089,6 +1166,10 @@ impl ChatActor {
                         cancel_and_settle(client, session_id, &mut prompt).await;
                         return Ok(PromptEnd::Stopped);
                     }
+                    // Pulled but not yet prompted — journal it so a crash
+                    // or shutdown mid-turn re-delivers it next run.
+                    self.inflight.queued.push((*event).clone());
+                    self.persist_inflight();
                     pending.push(*event);
                 }
                 Race::Tick => {
@@ -1617,7 +1698,7 @@ fn nudge_event(chat: Option<&ChatKey>, note: &str) -> String {
 /// can legitimately end a turn with no output.
 fn wants_answer(event: &ChatEvent) -> bool {
     event.attention == "direct"
-        && matches!(event.kind, "message" | "command" | "button")
+        && matches!(event.kind.as_str(), "message" | "command" | "button")
         && !event.is_stop()
 }
 
@@ -1987,6 +2068,63 @@ event needs. Never tell the user you can't hear or see a file you haven't \
 tried to open.
 ";
 
+/// Events pulled off the wire whose dispatch was never confirmed —
+/// `sent` is the batch a turn was prompted with, `queued` the events
+/// coalesced mid-turn. Persisted as `data_dir/inflight.json`; a
+/// confirmed turn end clears `sent`, while shutdown and crashes leave
+/// the file for the next run's replay. IM history stays the durable
+/// record — the journal only tracks what the agent may never have seen.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct Inflight {
+    /// Events already sent as a prompt whose turn never reached a
+    /// confirmed end — replays the model may have partly seen.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    sent: Vec<ChatEvent>,
+    /// Events pulled mid-turn, journaled but never prompted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    queued: Vec<ChatEvent>,
+}
+
+fn load_inflight(data_dir: &Path) -> Inflight {
+    let Ok(text) = std::fs::read_to_string(data_dir.join("inflight.json")) else {
+        return Inflight::default();
+    };
+    match serde_json::from_str(&text) {
+        Ok(inflight) => inflight,
+        // A corrupt journal still means lost events — say so loudly.
+        Err(error) => {
+            warn!(%error, "corrupt inflight.json; its events stay in IM history only");
+            Inflight::default()
+        }
+    }
+}
+
+/// Write-then-rename, like `sessions.json`: a crash mid-write must not
+/// corrupt the only record of undelivered events. An empty journal
+/// removes the file — nothing to replay.
+fn save_inflight(data_dir: &Path, inflight: &Inflight) {
+    let target = data_dir.join("inflight.json");
+    if inflight.sent.is_empty() && inflight.queued.is_empty() {
+        match std::fs::remove_file(&target) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => warn!(%error, "failed to remove inflight.json"),
+        }
+        return;
+    }
+    match serde_json::to_string_pretty(inflight) {
+        Ok(text) => {
+            let tmp = data_dir.join("inflight.json.tmp");
+            if let Err(error) =
+                std::fs::write(&tmp, &text).and_then(|()| std::fs::rename(&tmp, &target))
+            {
+                warn!(%error, "failed to persist inflight.json");
+            }
+        }
+        Err(error) => warn!(%error, "failed to serialize inflight journal"),
+    }
+}
+
 /// Sessions awaiting handoff recovery, `slug → session id`, persisted as
 /// JSON in `data_dir/sessions.json`. Empty after a clean shutdown.
 fn load_sessions(data_dir: &Path) -> HashMap<String, String> {
@@ -2039,12 +2177,12 @@ pub(super) mod tests {
     /// A chat event carrying `text` from a fixed tester identity.
     fn test_event(text: &str, message_id: i64) -> ChatEvent {
         ChatEvent {
-            kind: "message",
-            platform: "telegram",
+            kind: "message".into(),
+            platform: "telegram".into(),
             chat: "0".to_string(),
             ts: 0,
-            attention: "direct",
-            chat_type: Some("private"),
+            attention: "direct".into(),
+            chat_type: Some("private".into()),
             chat_title: None,
             message_id: Some(message_id),
             from: crate::chat::EventSender {
@@ -2070,21 +2208,21 @@ pub(super) mod tests {
         assert!(wants_answer(&test_event("hi", 1)));
 
         let mut ambient = test_event("hi", 1);
-        ambient.attention = "ambient";
+        ambient.attention = "ambient".into();
         assert!(!wants_answer(&ambient));
 
         let mut reaction = test_event("", 1);
-        reaction.kind = "reaction";
+        reaction.kind = "reaction".into();
         assert!(!wants_answer(&reaction));
 
         let mut edited = test_event("fixed typo", 1);
-        edited.kind = "edited";
+        edited.kind = "edited".into();
         assert!(!wants_answer(&edited));
 
         assert!(!wants_answer(&test_event("stop", 1)));
 
         let mut button = test_event("", 1);
-        button.kind = "button";
+        button.kind = "button".into();
         button.text = None;
         button.button = Some("yes".to_string());
         assert!(wants_answer(&button));
@@ -2111,6 +2249,51 @@ pub(super) mod tests {
         assert_eq!(blocked["type"], "nudge");
         let note = blocked["note"].as_str().unwrap();
         assert!(note.contains("run_command") && note.contains("subagent"));
+    }
+
+    /// The in-flight journal round-trips through `inflight.json` and an
+    /// empty journal removes the file — nothing left to replay.
+    #[test]
+    fn inflight_journal_roundtrips_and_clears() {
+        let dir = std::env::temp_dir().join(format!("acpbot-inflight-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let inflight = Inflight {
+            sent: vec![test_event("first", 1)],
+            queued: vec![test_event("second", 2)],
+        };
+        save_inflight(&dir, &inflight);
+
+        let loaded = load_inflight(&dir);
+        assert_eq!(loaded.sent.len(), 1);
+        assert_eq!(loaded.queued.len(), 1);
+        assert_eq!(
+            loaded.sent[0].to_prompt_text(),
+            inflight.sent[0].to_prompt_text()
+        );
+        assert_eq!(loaded.queued[0].text.as_deref(), Some("second"));
+
+        // A confirmed turn end empties the journal — the file goes away.
+        save_inflight(&dir, &Inflight::default());
+        assert!(!dir.join("inflight.json").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A corrupt or absent journal loads empty — startup never fails on
+    /// it, and IM history still holds every event it referenced.
+    #[test]
+    fn inflight_corrupt_loads_empty() {
+        let dir = std::env::temp_dir().join(format!("acpbot-inflight-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("inflight.json"), "not json").unwrap();
+        let loaded = load_inflight(&dir);
+        assert!(loaded.sent.is_empty() && loaded.queued.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let missing = std::env::temp_dir().join("acpbot-inflight-absent");
+        assert!(load_inflight(&missing).sent.is_empty());
     }
 
     /// Wait until the transcript stops growing for `quiet` — the only
@@ -2249,7 +2432,7 @@ pub(super) mod tests {
 
     fn test_key() -> ChatKey {
         ChatKey {
-            platform: "telegram",
+            platform: "telegram".into(),
             id: "0".to_string(),
         }
     }
@@ -2336,7 +2519,7 @@ pub(super) mod tests {
             .history(&test_key())
             .append_event(&serde_json::json!({"ts":1}));
         router.history(&ChatKey {
-            platform: "telegram",
+            platform: "telegram".into(),
             id: "7".to_string(),
         });
         assert_eq!(router.history(&test_key()).tail(None, None, 10).len(), 1);

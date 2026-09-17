@@ -110,13 +110,13 @@ impl ChatRegistry {
     /// the event arrived in.
     pub fn note_event(&mut self, event: &ChatEvent) {
         let key = ChatKey {
-            platform: event.platform,
+            platform: event.platform.clone(),
             id: event.chat.clone(),
         };
         self.note(
             &key,
             event.ts,
-            event.chat_type,
+            event.chat_type.as_deref(),
             event.chat_title.as_deref(),
             event.thread_id,
         );
@@ -133,7 +133,7 @@ impl ChatRegistry {
         &mut self,
         key: &ChatKey,
         ts: i64,
-        chat_type: Option<&'static str>,
+        chat_type: Option<&str>,
         title: Option<&str>,
         thread_id: Option<i64>,
     ) {
@@ -201,11 +201,11 @@ mod tests {
 
     fn event(chat: &str, ts: i64) -> ChatEvent {
         ChatEvent {
-            kind: "message",
-            platform: "telegram",
+            kind: "message".into(),
+            platform: "telegram".into(),
             chat: chat.to_string(),
             ts,
-            attention: "direct",
+            attention: "direct".into(),
             chat_type: None,
             chat_title: None,
             message_id: None,
@@ -231,7 +231,7 @@ mod tests {
         assert!(registry.records().is_empty());
 
         let mut first = event("-100", 100);
-        first.chat_type = Some("supergroup");
+        first.chat_type = Some("supergroup".into());
         first.chat_title = Some("The Group".to_string());
         first.thread_id = Some(7);
         registry.note_event(&first);
@@ -267,7 +267,7 @@ mod tests {
             let mut registry = ChatRegistry::load(&dir);
             registry.note_outbound(
                 &ChatKey {
-                    platform: "telegram",
+                    platform: "telegram".into(),
                     id: "42".to_string(),
                 },
                 500,

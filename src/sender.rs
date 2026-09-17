@@ -1432,13 +1432,13 @@ fn filename(path: &Path) -> Result<&str, SenderError> {
 /// `MediaKind` as the wire-protocol kind string.
 fn kind_str(kind: MediaKind) -> &'static str {
     match kind {
-        MediaKind::Photo => "photo",
-        MediaKind::Video => "video",
-        MediaKind::Audio => "audio",
-        MediaKind::Voice => "voice",
-        MediaKind::Animation => "animation",
-        MediaKind::Sticker => "sticker",
-        MediaKind::Document => "document",
+        MediaKind::Photo => "photo".into(),
+        MediaKind::Video => "video".into(),
+        MediaKind::Audio => "audio".into(),
+        MediaKind::Voice => "voice".into(),
+        MediaKind::Animation => "animation".into(),
+        MediaKind::Sticker => "sticker".into(),
+        MediaKind::Document => "document".into(),
     }
 }
 
@@ -1596,7 +1596,7 @@ mod tests {
         let sender = Sender::telegram(
             client,
             &ChatKey {
-                platform: "telegram",
+                platform: "telegram".into(),
                 id: chat,
             },
             spoke_tx,

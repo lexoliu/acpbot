@@ -40,7 +40,13 @@ must do the same (see `ensure_executor` in test modules).
   A session id in `sessions.json` is a "died before handoff" marker — the
   next spawn restores it only to extract the summary, never to resume.
   Forwards event batches as prompts, runs the first-reply watchdog and
-  the idle-compaction timer. The router maps
+  the idle-compaction timer. Every event pulled off the wire is journaled
+  to `inflight.json` — `sent` while its turn is unconfirmed, `queued`
+  when coalesced mid-turn — and a confirmed turn end clears it, so a
+  crash or shutdown replays exactly what the agent never finished
+  (events already in IM history are re-prompted, never re-logged; the
+  prompt flags replays so the model checks `history` before
+  re-answering). The router maps
   `ChatKey` → per-chat `Sender`/`History`/topic cell and tracks the
   turn's triggering chat, which tools' optional `chat` argument defaults to.
 - `sender.rs` — `Platform` enum (`Telegram`, `Discord`, `Cli`, test `Record`):
