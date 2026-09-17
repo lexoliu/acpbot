@@ -113,6 +113,10 @@ const CONTINUITY_FILE: &str = "CONTINUITY.md";
 /// into the crash-recovery path or a memory-less start.
 const HANDOFF_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// How many times a turn that owed an answer but produced no outbound
+/// action is re-prompted with a nudge before the agent is left alone.
+const SILENT_TURN_NUDGES: u32 = 2;
+
 /// The maintenance prompt that makes a session write its own handoff
 /// note — plain text so any harness can follow it. The target file goes
 /// in as an absolute path: a harness may resolve a bare `CONTINUITY.md`
@@ -826,11 +830,15 @@ impl ChatActor {
         let _typing = self.start_turn_typing(current, turn_started);
         self.last_action
             .store(crate::sender::epoch_ms(), Ordering::Relaxed);
+        // `last_action` moves only on real outbound actions — capturing it
+        // here makes "the turn never spoke" detectable when it ends.
+        let spoke_at_start = self.last_action.load(Ordering::Relaxed);
+        let wants_answer = batch.iter().any(wants_answer);
 
         let client = self.client.clone().expect("ensure_ready ran");
         let session_id = self.session_id.clone().expect("ensure_ready ran");
 
-        let outcome = match self
+        let mut end = match self
             .prompt_with_nudges(&client, &session_id, prompt.clone(), rx, pending)
             .await
         {
@@ -839,13 +847,9 @@ impl ChatActor {
             // alive; the run loop's graceful_close runs the handoff and
             // owns the teardown.
             Ok(PromptEnd::Shutdown) => return Ok(()),
-            Ok(PromptEnd::Done(result)) => {
-                debug_turn_end(&result);
-                Ok(())
-            }
             // The user said stop: the turn is already cancelled and its
             // remaining work discarded — a quiet end, not a failure.
-            Ok(PromptEnd::Stopped) => Ok(()),
+            Ok(end) => end,
             // A dead child fails every pending request with `Closed`: respawn
             // once, reload the session, and retry the prompt once.
             Err(ClientError::Closed { .. }) => {
@@ -861,15 +865,59 @@ impl ChatActor {
                     .prompt_with_nudges(&client, &session_id, prompt, rx, pending)
                     .await
                 {
-                    Ok(PromptEnd::Done(result)) => {
-                        debug_turn_end(&result);
-                        Ok(())
-                    }
-                    Ok(PromptEnd::Shutdown | PromptEnd::Stopped) => Ok(()),
-                    Err(error) => Err(error.into()),
+                    Ok(PromptEnd::Shutdown) => return Ok(()),
+                    Ok(end) => end,
+                    Err(error) => return Err(error.into()),
                 }
             }
-            Err(error) => Err(error.into()),
+            Err(error) => return Err(error.into()),
+        };
+        if let PromptEnd::Done(result) = &end {
+            debug_turn_end(result);
+        }
+
+        // A direct question whose turn ends with no outbound action almost
+        // always means the model wrote its reply as plain text — discarded,
+        // never seen. Re-prompt with a nudge naming the failure, a bounded
+        // number of times; each re-prompt is itself watchdogged.
+        let mut retries = SILENT_TURN_NUDGES;
+        while wants_answer
+            && matches!(end, PromptEnd::Done(_))
+            && retries > 0
+            && self.last_action.load(Ordering::Relaxed) == spoke_at_start
+        {
+            retries -= 1;
+            warn!(
+                chat = ?self.router.current(),
+                "turn ended with no chat output; nudging the agent"
+            );
+            let nudge = vec![ContentBlock::Text(TextContent {
+                text: silent_turn_event_text(self.router.current().as_ref()),
+                annotations: None,
+                meta: None,
+            })];
+            let (Some(client), Some(session_id)) = (self.client.clone(), self.session_id.clone())
+            else {
+                break;
+            };
+            match self
+                .prompt_with_nudges(&client, &session_id, nudge, rx, pending)
+                .await
+            {
+                Ok(PromptEnd::Shutdown) => return Ok(()),
+                Ok(next) => {
+                    if let PromptEnd::Done(result) = &next {
+                        debug_turn_end(result);
+                    }
+                    end = next;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        let outcome = match end {
+            PromptEnd::Done(_) | PromptEnd::Stopped => Ok(()),
+            PromptEnd::Shutdown => unreachable!("shutdown returns above"),
         };
 
         // The agent asked to be reincarnated this turn (new skills or edited
@@ -1466,22 +1514,50 @@ async fn cancel_and_settle(
     .await;
 }
 
-/// The `nudge` event text injected after a silence interrupt — a `system`
-/// event in the same envelope the agent already parses, carrying the chat
-/// the interrupted turn was answering so the update lands in the right room.
-fn nudge_event_text(chat: Option<&ChatKey>) -> String {
+/// A `nudge` event in the same envelope the agent already parses,
+/// carrying the chat the turn was answering so the update lands in the
+/// right room.
+fn nudge_event(chat: Option<&ChatKey>, note: &str) -> String {
     let mut event = serde_json::json!({
         "type": "nudge",
         "ts": crate::sender::epoch_secs(),
-        "note": "You have been silent too long — the user is waiting. \
-                 Send a short update now, then continue the task you were \
-                 doing.",
+        "note": note,
     });
     if let Some(chat) = chat {
         event["platform"] = serde_json::json!(chat.platform);
         event["chat"] = serde_json::json!(chat.id);
     }
     event.to_string()
+}
+
+/// Whether an event expects a visible answer: a direct message, command,
+/// or button press. `reaction`/`edited`/`stop` events and ambient chatter
+/// can legitimately end a turn with no output.
+fn wants_answer(event: &ChatEvent) -> bool {
+    event.attention == "direct"
+        && matches!(event.kind, "message" | "command" | "button")
+        && !event.is_stop()
+}
+
+/// The `nudge` injected after a mid-turn silence interrupt.
+fn nudge_event_text(chat: Option<&ChatKey>) -> String {
+    nudge_event(
+        chat,
+        "You have been silent too long — the user is waiting. Send a \
+         short update now, then continue the task you were doing.",
+    )
+}
+
+/// The `nudge` injected when a turn that owed an answer ended with no
+/// outbound action at all: the model almost certainly wrote its reply as
+/// ordinary text, which the chat never sees.
+fn silent_turn_event_text(chat: Option<&ChatKey>) -> String {
+    nudge_event(
+        chat,
+        "Your last turn ended with no chat output — anything you wrote as \
+         plain text was discarded and the user is still waiting. Answer \
+         again through a `chat` tool call (`send_message`/`reply`).",
+    )
 }
 
 /// Write the shared `AGENTS.md` and `.devin/mcp_config.json`.
@@ -1744,7 +1820,9 @@ always beats one bubble too many.
 
 **Never go dark mid-task.** The user must never wait more than ten seconds \
 with nothing from you. The daemon enforces it: a turn with no `chat` tool \
-call for ten seconds is cancelled and re-prompted as a `nudge` event. \
+call for ten seconds is cancelled and re-prompted as a `nudge` event — \
+and a turn that *ends* having never called one gets re-prompted too, \
+because the answer you typed went nowhere. \
 When a `nudge` arrives, your FIRST action is again a `chat` tool call — \
 one line like \\\"still working, X so far\\\" — then you continue the task \
 you were doing. Plan for it: on anything long, send a progress line \
@@ -1782,8 +1860,9 @@ to. A `reaction` event means a user changed reactions on `message_id`: \
 `custom:<id>`, paid reactions as `paid`). An `edited` event is a message \
 the user rewrote — `text` is the new content. `thread_id` appears when \
 the chat is a forum; your sends follow the current topic automatically. \
-A `nudge` event is the daemon interrupting a silent turn — see the \
-ten-second rule above.
+A `nudge` event is the daemon interrupting a silent turn — or re-prompting \
+one that ended without a single chat tool call; its `note` says which. \
+See the ten-second rule above.
 
 Media arrive as `sticker` `{file_id, emoji, set_name, format}` or `media` \
 `{kind, file_id}` — resend them with `send_sticker`/`send_file` `file_id`. \
@@ -1795,9 +1874,13 @@ The file also downloads into `inbox/` inside your working directory: \
 with your file tools exactly as given; do not resolve it yourself — \
 harnesses that default relative paths elsewhere would miss the file. \
 When your client declared `image`/`audio` prompt support, those payloads \
-also reach you as native `image`/`audio` content blocks. Otherwise the \
-file is yours: inspect it, extract frames or waveforms with ffmpeg, or \
-transcribe it — whatever the event needs.
+also reach you as native `image`/`audio` content blocks. Even without \
+them, the file IS the media: on a multimodal harness (e.g. Antigravity's \
+`view_file`) opening it plays voice notes and video natively — you hear \
+and see them, no transcription step needed. Failing that, inspect it, \
+extract frames or waveforms with ffmpeg, or transcribe it — whatever the \
+event needs. Never tell the user you can't hear or see a file you haven't \
+tried to open.
 ";
 
 /// Sessions awaiting handoff recovery, `slug → session id`, persisted as
@@ -1873,6 +1956,51 @@ pub(super) mod tests {
             reaction: None,
             thread_id: None,
         }
+    }
+
+    /// A silent turn is worth re-prompting only when the batch asked a
+    /// question: direct messages, commands, and buttons count; reactions,
+    /// edits, stops, and ambient chatter don't.
+    #[test]
+    fn wants_answer_scopes_to_answerable_events() {
+        assert!(wants_answer(&test_event("hi", 1)));
+
+        let mut ambient = test_event("hi", 1);
+        ambient.attention = "ambient";
+        assert!(!wants_answer(&ambient));
+
+        let mut reaction = test_event("", 1);
+        reaction.kind = "reaction";
+        assert!(!wants_answer(&reaction));
+
+        let mut edited = test_event("fixed typo", 1);
+        edited.kind = "edited";
+        assert!(!wants_answer(&edited));
+
+        assert!(!wants_answer(&test_event("stop", 1)));
+
+        let mut button = test_event("", 1);
+        button.kind = "button";
+        button.text = None;
+        button.button = Some("yes".to_string());
+        assert!(wants_answer(&button));
+    }
+
+    /// Both nudge variants ride the same envelope; the silent-turn one
+    /// names the failure it is recovering from.
+    #[test]
+    fn nudge_events_carry_chat_and_note() {
+        let key = test_key();
+        let silent: serde_json::Value =
+            serde_json::from_str(&silent_turn_event_text(Some(&key))).unwrap();
+        assert_eq!(silent["type"], "nudge");
+        assert_eq!(silent["platform"], "telegram");
+        assert_eq!(silent["chat"], "0");
+        assert!(silent["note"].as_str().unwrap().contains("no chat output"));
+
+        let mid: serde_json::Value = serde_json::from_str(&nudge_event_text(Some(&key))).unwrap();
+        assert_eq!(mid["type"], "nudge");
+        assert!(mid["note"].as_str().unwrap().contains("silent too long"));
     }
 
     /// Wait until the transcript stops growing for `quiet` — the only
