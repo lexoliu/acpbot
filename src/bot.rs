@@ -435,10 +435,10 @@ fn discord_media_kind(attachment: &botkit_discord::Attachment) -> &'static str {
         .as_deref()
         .and_then(|ct| ct.split('/').next())
     {
-        Some("image") => "photo".into(),
-        Some("video") => "video".into(),
-        Some("audio") => "audio".into(),
-        _ => "document".into(),
+        Some("image") => "photo",
+        Some("video") => "video",
+        Some("audio") => "audio",
+        _ => "document",
     }
 }
 
@@ -634,10 +634,10 @@ fn update_chat(update: &Update) -> Option<&botkit_telegram::types::Chat> {
 /// The platform-reported chat shape, when the update carries a chat.
 fn chat_kind(update: &Update) -> Option<&'static str> {
     update_chat(update).map(|chat| match chat.chat_type {
-        ChatType::Private => "private".into(),
-        ChatType::Group => "group".into(),
-        ChatType::Supergroup => "supergroup".into(),
-        ChatType::Channel => "channel".into(),
+        ChatType::Private => "private",
+        ChatType::Group => "group",
+        ChatType::Supergroup => "supergroup",
+        ChatType::Channel => "channel",
     })
 }
 
