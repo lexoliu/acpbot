@@ -125,7 +125,8 @@ fn run(config_path: &Path) -> Result<(), MainError> {
             if me.can_read_all_group_messages == Some(false) {
                 warn!(
                     "bot privacy mode is ON — Telegram only delivers commands, \
-                     replies and mentions; ambient group messages never arrive. \
+                     replies and mentions; ambient group messages never arrive \
+                     (except where the bot is a group admin — admins see all). \
                      Disable it via @BotFather for topic-following"
                 );
             }
