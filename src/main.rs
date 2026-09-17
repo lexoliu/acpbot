@@ -18,6 +18,7 @@ mod error;
 mod handler;
 mod history;
 mod mcpserver;
+mod preview;
 mod registry;
 mod sandbox;
 mod sender;
@@ -216,6 +217,7 @@ fn run(config_path: &Path) -> Result<(), MainError> {
         sender_for,
         sticker_library,
         config.browser,
+        config.preview,
         config.platform.name(),
     );
     // Kept, not detached: on shutdown the dispatcher's drop chain is what

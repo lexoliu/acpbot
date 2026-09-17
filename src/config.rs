@@ -22,6 +22,9 @@ pub struct Config {
     /// The daemon-hosted stealth browser (`[browser]`).
     #[serde(default)]
     pub browser: BrowserConfig,
+    /// Link previews on inbound messages (`[preview]`).
+    #[serde(default)]
+    pub preview: PreviewConfig,
 }
 
 /// Which chat platform to connect to, and its credentials.
@@ -452,6 +455,48 @@ fn default_browser_enabled() -> bool {
 
 fn default_browser_headless() -> bool {
     true
+}
+
+/// Inbound link previews (`[preview]`).
+///
+/// When a message's text carries `http(s)` links the daemon fetches each
+/// one and attaches its title/description (or a Telegram post's body) to
+/// the event's `link_previews` before prompting, so the agent doesn't
+/// spend turns fetching them itself. Fetches run on the host network;
+/// loopback/private hosts and private Telegram links are never fetched.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PreviewConfig {
+    /// `false` leaves events untouched (default `true`).
+    #[serde(default = "default_preview_enabled")]
+    pub enabled: bool,
+    /// Per-link fetch timeout, seconds (default 8).
+    #[serde(default = "default_preview_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Max links previewed per message (default 3).
+    #[serde(default = "default_preview_max_links")]
+    pub max_links: usize,
+}
+
+impl Default for PreviewConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_preview_enabled(),
+            timeout_secs: default_preview_timeout_secs(),
+            max_links: default_preview_max_links(),
+        }
+    }
+}
+
+fn default_preview_enabled() -> bool {
+    true
+}
+
+fn default_preview_timeout_secs() -> u64 {
+    8
+}
+
+fn default_preview_max_links() -> usize {
+    3
 }
 
 /// Directories the daemon owns.

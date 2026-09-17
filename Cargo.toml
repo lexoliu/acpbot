@@ -43,3 +43,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 jiff = "0.2.37"
 async-process = "2"
 async-tungstenite = { version = "0.31", default-features = false, features = ["handshake", "futures-03-sink"] }
+zenwave = "0.5"
+linkify = "0.11.0"
+tl = "0.7.8"
+html-escape = "0.2.15"
+url = "2.5.8"

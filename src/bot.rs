@@ -199,6 +199,7 @@ fn to_event(ctx: &Context, me: &Identity) -> ChatEvent {
         sticker: None,
         media: None,
         reaction: None,
+        link_previews: Vec::new(),
         thread_id: None,
     };
     if let Some(data) = ctx.platform::<CliContextData>() {
