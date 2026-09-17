@@ -180,11 +180,11 @@ fn to_event(ctx: &Context, me: &Identity) -> ChatEvent {
         "telegram"
     };
     let base = ChatEvent {
-        kind: "message",
-        platform,
+        kind: "message".into(),
+        platform: platform.into(),
         chat: ctx.channel_id().to_string(),
         ts: crate::sender::epoch_secs(),
-        attention: "direct",
+        attention: "direct".into(),
         chat_type: None,
         chat_title: None,
         message_id: None,
@@ -228,12 +228,12 @@ fn extract_cli(data: &CliContextData, mut event: ChatEvent) -> ChatEvent {
     use botkit_cli::Inbound;
     match &data.event {
         Inbound::Message(message) => {
-            event.kind = "message";
+            event.kind = "message".into();
             event.message_id = message.message_id;
             event.text = message.text.clone().or_else(|| message.caption.clone());
             event.thread_id = message.thread_id;
             if message.ambient {
-                event.attention = "ambient";
+                event.attention = "ambient".into();
             }
             event.reply_to = message.reply_to.as_ref().map(|replied| EventReplyRef {
                 message_id: replied.message_id,
@@ -245,12 +245,12 @@ fn extract_cli(data: &CliContextData, mut event: ChatEvent) -> ChatEvent {
             });
             event.media = message.files.first().map(|file| EventMedia {
                 kind: match file.kind.as_str() {
-                    "photo" => "photo",
-                    "video" => "video",
-                    "audio" => "audio",
-                    "voice" => "voice",
-                    "animation" => "animation",
-                    _ => "document",
+                    "photo" => "photo".into(),
+                    "video" => "video".into(),
+                    "audio" => "audio".into(),
+                    "voice" => "voice".into(),
+                    "animation" => "animation".into(),
+                    _ => "document".into(),
                 },
                 // The wire file's resend id defaults to its local path —
                 // `fetch_media` resolves either to bytes under `inbox/`.
@@ -262,15 +262,15 @@ fn extract_cli(data: &CliContextData, mut event: ChatEvent) -> ChatEvent {
                 emoji: sticker.emoji.clone(),
                 set_name: sticker.set_name.clone(),
                 format: match sticker.format.as_str() {
-                    "animated" => "animated",
-                    "video" => "video",
-                    _ => "static",
+                    "animated" => "animated".into(),
+                    "video" => "video".into(),
+                    _ => "static".into(),
                 },
                 file: None,
             });
         }
         Inbound::Command(command) => {
-            event.kind = "command";
+            event.kind = "command".into();
             event.message_id = command.message_id;
             event.thread_id = command.thread_id;
             event.command = Some(EventCommand {
@@ -283,14 +283,14 @@ fn extract_cli(data: &CliContextData, mut event: ChatEvent) -> ChatEvent {
             });
         }
         Inbound::Button(button) => {
-            event.kind = "button";
+            event.kind = "button".into();
             event.message_id = button.message_id;
             event.text = button.message_text.clone();
             event.button = Some(button.data.clone());
             event.thread_id = button.thread_id;
         }
         Inbound::Reaction(reaction) => {
-            event.kind = "reaction";
+            event.kind = "reaction".into();
             event.message_id = Some(reaction.message_id);
             event.reaction = Some(EventReaction {
                 added: reaction.added.clone(),
@@ -298,7 +298,7 @@ fn extract_cli(data: &CliContextData, mut event: ChatEvent) -> ChatEvent {
             });
         }
         Inbound::Edited(edited) => {
-            event.kind = "edited";
+            event.kind = "edited".into();
             event.message_id = Some(edited.message_id);
             event.text = edited.text.clone();
             event.thread_id = edited.thread_id;
@@ -317,18 +317,21 @@ fn extract_discord_message(
     me: &Identity,
 ) -> ChatEvent {
     let message = data.message();
-    event.kind = if data.edited { "edited" } else { "message" };
+    event.kind = if data.edited { "edited" } else { "message" }.into();
     event.message_id = Some(snowflake(&message.id));
     if let Some(ts) = discord_ts(message) {
         event.ts = ts;
     }
     event.text = (!message.content.is_empty()).then(|| message.content.clone());
-    event.chat_type = Some(if message.guild_id.is_some() {
-        "group"
-    } else {
-        "private"
-    });
-    event.attention = discord_attention(message, me);
+    event.chat_type = Some(
+        if message.guild_id.is_some() {
+            "group"
+        } else {
+            "private"
+        }
+        .into(),
+    );
+    event.attention = discord_attention(message, me).into();
     event.reply_to = message.referenced_message.as_ref().map(|m| EventReplyRef {
         message_id: snowflake(&m.id),
         from: Some(
@@ -351,16 +354,19 @@ fn extract_discord_message(
 /// message's id and text alongside).
 fn extract_discord_interaction(data: &DiscordContextData, mut event: ChatEvent) -> ChatEvent {
     // Interactions only exist on things aimed at the bot.
-    event.attention = "direct";
+    event.attention = "direct".into();
     let interaction = data.interaction();
-    event.chat_type = Some(if interaction.guild_id.is_some() {
-        "group"
-    } else {
-        "private"
-    });
+    event.chat_type = Some(
+        if interaction.guild_id.is_some() {
+            "group"
+        } else {
+            "private"
+        }
+        .into(),
+    );
     match &interaction.data {
         Some(InteractionData::ApplicationCommand { name, options, .. }) => {
-            event.kind = "command";
+            event.kind = "command".into();
             event.command = Some(EventCommand {
                 name: name.clone(),
                 args: (!options.is_empty()).then(|| {
@@ -379,7 +385,7 @@ fn extract_discord_interaction(data: &DiscordContextData, mut event: ChatEvent) 
             InteractionData::MessageComponent { custom_id, .. }
             | InteractionData::ModalSubmit { custom_id, .. },
         ) => {
-            event.kind = "button";
+            event.kind = "button".into();
             event.button = Some(custom_id.clone());
             if let Some(message) = &interaction.message {
                 event.message_id = Some(snowflake(&message.id));
@@ -416,7 +422,7 @@ fn discord_attention(message: &botkit_discord::Message, me: &Identity) -> &'stat
 /// A Discord attachment as `EventMedia` — `file_id` carries the CDN URL.
 fn discord_event_media(attachment: &botkit_discord::Attachment) -> EventMedia {
     EventMedia {
-        kind: discord_media_kind(attachment),
+        kind: discord_media_kind(attachment).into(),
         file_id: attachment.url.clone(),
         file: None,
     }
@@ -462,9 +468,9 @@ fn extract_telegram(
         name: name.to_string(),
         args: ctx.command_args().map(str::to_string),
     });
-    event.chat_type = chat_kind(&data.update);
+    event.chat_type = chat_kind(&data.update).map(String::from);
     event.chat_title = update_chat(&data.update).and_then(|chat| chat.title.clone());
-    event.attention = attention(&data.update, me);
+    event.attention = attention(&data.update, me).into();
 
     match &data.update.kind {
         UpdateKind::Message(message) | UpdateKind::EditedMessage(message) => {
@@ -475,7 +481,8 @@ fn extract_telegram(
                 "command"
             } else {
                 "message"
-            };
+            }
+            .into();
             event.message_id = Some(message.message_id);
             event.ts = message.edit_date.unwrap_or(message.date);
             event.text = message.text.clone().or_else(|| message.caption.clone());
@@ -497,7 +504,7 @@ fn extract_telegram(
             event.media = event_media(message);
         }
         UpdateKind::CallbackQuery(query) => {
-            event.kind = "button";
+            event.kind = "button".into();
             event.message_id = query.message.as_ref().map(|m| m.message_id);
             if let Some(m) = &query.message {
                 event.ts = m.date;
@@ -511,7 +518,7 @@ fn extract_telegram(
             event.thread_id = query.message.as_ref().and_then(|m| m.message_thread_id);
         }
         UpdateKind::MessageReaction(reaction) => {
-            event.kind = "reaction";
+            event.kind = "reaction".into();
             event.message_id = Some(reaction.message_id);
             event.text = None;
             if let Some(date) = reaction.date {
@@ -548,7 +555,8 @@ fn event_sticker(s: &botkit_telegram::Sticker) -> EventSticker {
             "video"
         } else {
             "static"
-        },
+        }
+        .into(),
         file: None,
     }
 }
@@ -577,7 +585,7 @@ fn event_media(message: &botkit_telegram::Message) -> Option<EventMedia> {
                 .map(|p| ("photo", &p.file_id))
         })
         .map(|(kind, file_id)| EventMedia {
-            kind,
+            kind: kind.into(),
             file_id: file_id.clone(),
             file: None,
         })
@@ -608,7 +616,8 @@ fn extract_generic(ctx: &Context, mut event: ChatEvent) -> ChatEvent {
         "button"
     } else {
         "message"
-    };
+    }
+    .into();
     event
 }
 

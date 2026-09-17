@@ -1596,7 +1596,7 @@ mod tests {
         let sender = Sender::telegram(
             client,
             &ChatKey {
-                platform: "telegram",
+                platform: "telegram".into(),
                 id: chat,
             },
             spoke_tx,

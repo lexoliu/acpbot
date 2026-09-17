@@ -1255,7 +1255,7 @@ mod tests {
 
     fn test_key() -> ChatKey {
         ChatKey {
-            platform: "telegram",
+            platform: "telegram".into(),
             id: "0".to_string(),
         }
     }
