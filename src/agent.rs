@@ -17,7 +17,8 @@ use std::time::{Duration, Instant};
 use crate::error::{AgentError, SenderError};
 use aither_acp::{
     AcpClient, AgentCapabilities, AudioContent, ClientError, ContentBlock, ImageContent,
-    PromptCapabilities, PromptResult, TextContent,
+    PromptCapabilities, PromptParams, PromptResult, SessionLoadParams, SessionNewParams,
+    SessionResumeParams, SessionSetConfigOptionParams, SessionSetModeParams, TextContent,
 };
 use async_channel::{Receiver, Sender as ChanSender};
 use base64::Engine as _;
@@ -387,13 +388,14 @@ impl ChatActor {
         }
         info!(chat = %self.key, "idle; compacting session");
         let result = client
-            .prompt(
-                &session_id,
+            .prompt(PromptParams::new(
+                session_id.clone(),
                 vec![ContentBlock::Text(TextContent {
                     text: "/compact".to_string(),
                     annotations: None,
+                    meta: None,
                 })],
-            )
+            ))
             .await?;
         debug!(chat = %self.key, stop = ?result.stop_reason, "idle compaction done");
         Ok(())
@@ -450,6 +452,7 @@ impl ChatActor {
         let mut prompt = vec![ContentBlock::Text(TextContent {
             text,
             annotations: None,
+            meta: None,
         })];
         for file in batch.iter().flat_map(ChatEvent::files) {
             let is_image = self.prompt_caps.image && file.mime.starts_with("image/");
@@ -464,9 +467,20 @@ impl ChatActor {
             let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
             let mime_type = file.mime.clone();
             prompt.push(if is_image {
-                ContentBlock::Image(ImageContent { data, mime_type })
+                ContentBlock::Image(ImageContent {
+                    data: Some(data),
+                    uri: None,
+                    mime_type,
+                    annotations: None,
+                    meta: None,
+                })
             } else {
-                ContentBlock::Audio(AudioContent { data, mime_type })
+                ContentBlock::Audio(AudioContent {
+                    data,
+                    mime_type,
+                    annotations: None,
+                    meta: None,
+                })
             });
         }
 
@@ -565,7 +579,7 @@ impl ChatActor {
         let nudge_after = self.shared.agent.nudge_after();
         let mut prompt: Pin<
             Box<dyn Future<Output = Result<PromptResult, ClientError>> + Send + '_>,
-        > = Box::pin(client.prompt(session_id, content));
+        > = Box::pin(client.prompt(PromptParams::new(session_id, content)));
         // Once `rx` closes no event can ever arrive — drop the arm rather
         // than spin on instant `Err`s.
         let mut events_open = true;
@@ -635,13 +649,14 @@ impl ChatActor {
                     // again.
                     self.last_action
                         .store(crate::sender::epoch_ms(), Ordering::Relaxed);
-                    prompt = Box::pin(client.prompt(
+                    prompt = Box::pin(client.prompt(PromptParams::new(
                         session_id,
                         vec![ContentBlock::Text(TextContent {
                             text: nudge_event_text(),
                             annotations: None,
+                            meta: None,
                         })],
-                    ));
+                    )));
                 }
             }
         }
@@ -715,11 +730,21 @@ impl ChatActor {
             None => self.new_session(&client, &cwd).await?,
         };
 
-        if let Err(error) = client.set_mode(&session_id, &self.shared.agent.mode).await {
+        if let Err(error) = client
+            .set_mode(SessionSetModeParams::new(
+                session_id.clone(),
+                self.shared.agent.mode.clone(),
+            ))
+            .await
+        {
             warn!(chat = %self.key, %error, "set_mode failed");
         }
         if let Err(error) = client
-            .set_config_option(&session_id, "model", self.shared.agent.model.clone())
+            .set_config_option(SessionSetConfigOptionParams::new(
+                session_id.clone(),
+                "model",
+                self.shared.agent.model.clone(),
+            ))
             .await
         {
             warn!(chat = %self.key, %error, "set_config_option(model) failed");
@@ -813,7 +838,10 @@ impl ChatActor {
         cwd: &Path,
     ) -> Option<String> {
         if caps.session_capabilities.resume.is_some() {
-            match client.resume_session(sid, cwd, vec![]).await {
+            match client
+                .resume_session(SessionResumeParams::new(sid, cwd))
+                .await
+            {
                 Ok(_) => {
                     info!(chat = %self.key, session = sid, "resumed session");
                     return Some(sid.to_string());
@@ -823,7 +851,7 @@ impl ChatActor {
             }
         }
         if caps.load_session {
-            match client.load_session(sid, cwd, vec![]).await {
+            match client.load_session(SessionLoadParams::new(sid, cwd)).await {
                 Ok(_) => {
                     info!(chat = %self.key, session = sid, "loaded session");
                     return Some(sid.to_string());
@@ -840,7 +868,7 @@ impl ChatActor {
         client: &AcpClient<BotClientHandler>,
         cwd: &Path,
     ) -> Result<String, AgentError> {
-        let result = client.new_session(cwd, vec![]).await?;
+        let result = client.new_session(SessionNewParams::new(cwd)).await?;
         info!(chat = %self.key, session = %result.session_id, "session created");
         Ok(result.session_id)
     }

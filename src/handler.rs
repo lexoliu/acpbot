@@ -118,6 +118,7 @@ mod tests {
                 meta: None,
             }),
             meta: None,
+            extra: Default::default(),
         }
     }
 
