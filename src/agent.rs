@@ -113,15 +113,18 @@ const CONTINUITY_FILE: &str = "CONTINUITY.md";
 const HANDOFF_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// The maintenance prompt that makes a session write its own handoff
-/// note — plain text so any harness can follow it.
+/// note — plain text so any harness can follow it. The target file goes
+/// in as an absolute path: a harness may resolve a bare `CONTINUITY.md`
+/// against somewhere other than the session cwd (agy's file tools land
+/// in its scratch dir, not `cwd`).
 const HANDOFF_PROMPT: &str = "\
 The daemon is closing this session permanently — shutdown, restart, or a \
-harness swap. Write your handoff note to CONTINUITY.md in your working \
-directory (create or overwrite it): who you are, the chats and people you \
-know, what you were in the middle of, and what the next incarnation needs \
-to know. Plain markdown, as compact as accuracy allows. Do not call any \
-`chat` tools — nobody is watching; the file is this turn's only output. \
-Write it, then end the turn.";
+harness swap. Write your handoff note — who you are, the chats and people \
+you know, what you were in the middle of, and what the next incarnation \
+needs to know — to the file at the exact absolute path below (create or \
+overwrite it). Plain markdown, as compact as accuracy allows. Do not call \
+any `chat` tools — nobody is watching; the file is this turn's only \
+output. Write it, then end the turn.\n\nAbsolute path: ";
 
 /// The preamble a fresh session's bootstrap prompt gets — the previous
 /// incarnation's `CONTINUITY.md` text is appended after it.
@@ -1240,7 +1243,11 @@ impl ChatActor {
             warn!(%error, "handoff compaction failed");
         }
         if let Err(error) = self
-            .maintenance_prompt(client, session_id, HANDOFF_PROMPT.to_string())
+            .maintenance_prompt(
+                client,
+                session_id,
+                format!("{HANDOFF_PROMPT}{}", path.display()),
+            )
             .await
         {
             warn!(%error, "handoff prompt failed");
