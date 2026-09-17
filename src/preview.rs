@@ -296,7 +296,7 @@ fn parse(html: &str, url: &str, content_type: &str, post: Option<&str>) -> Event
         return preview;
     }
     let Ok(dom) = tl::parse(html, tl::ParserOptions::default()) else {
-        preview.error = Some("unparseable HTML".to_string());
+        preview.error = Some("unparsable HTML".to_string());
         return preview;
     };
     let parser = dom.parser();
