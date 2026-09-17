@@ -64,6 +64,11 @@ must do the same (see `ensure_executor` in test modules).
   by `Sender`, read back by the `history` and `search_history` tools
   (epoch/RFC3339/`30m`-style `since`/`until`). It outlives sessions by
   design; the ACP session context is disposable.
+- `registry.rs` — `chats.json` at the data-dir root: every chat the bot
+  has state for (`platform:id` → type/title/activity times/forum topics),
+  noted on each inbound event and on an outbound first touch, read back
+  by `list_chats`. No platform offers a chat-enumeration API, so the bot
+  keeps its own.
 - `stickers.rs`, `stickerset.rs` — the agent-evolvable sticker pack and its
   Telegram sticker-set publishing.
 - `stickerlib.rs` — the persistent catalog of foreign sticker sets

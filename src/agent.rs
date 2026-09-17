@@ -14,7 +14,7 @@
 //! "died before handoff" marker: the next spawn restores it just long
 //! enough to extract the summary, then starts fresh anyway.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -37,6 +37,7 @@ use crate::config::{AgentConfig, AgentIsolation};
 use crate::handler::BotClientHandler;
 use crate::history::{History, history_path};
 use crate::mcpserver;
+use crate::registry::{ChatRecord, ChatRegistry};
 use crate::sandbox::{AgentRuntime, BridgeTarget};
 use crate::sender::Sender;
 
@@ -100,7 +101,7 @@ const MEDIA_INLINE_LIMIT: u64 = 8 * 1024 * 1024;
 /// session. Per-chat slugs in a pre-shared `sessions.json` survive only so
 /// the first spawn after an upgrade can recover their old session's
 /// summary into the shared `CONTINUITY.md`.
-const SHARED_SLUG: &str = "shared";
+pub(crate) const SHARED_SLUG: &str = "shared";
 
 /// The file the outgoing session writes its handoff summary into — and the
 /// file the next incarnation receives as its bootstrap prompt. Lives in
@@ -168,8 +169,11 @@ pub struct ChatRouter {
     platform: &'static str,
 }
 
-#[derive(Default)]
 struct RouterState {
+    /// Every chat the bot has state for — `chats.json`, persisted on
+    /// change. No platform offers an enumeration API, so this is the only
+    /// list `list_chats` can serve.
+    registry: ChatRegistry,
     /// One sender per chat, built on demand.
     senders: HashMap<ChatKey, Sender>,
     /// One IM record per chat.
@@ -183,16 +187,21 @@ struct RouterState {
 
 impl RouterState {
     /// The IM record of `key` (`<data>/chats/<slug>/history.jsonl`),
-    /// opened on first use.
+    /// opened on first use. First sight of a chat also registers it — a
+    /// send or probe to an id no event ever came from is still a chat the
+    /// bot now holds state for.
     fn history(&mut self, key: &ChatKey, data_dir: &Path) -> Arc<History> {
-        self.histories
-            .entry(key.clone())
-            .or_insert_with(|| {
-                Arc::new(History::open(history_path(
-                    &data_dir.join("chats").join(key.slug()),
-                )))
-            })
-            .clone()
+        if let Some(history) = self.histories.get(key) {
+            return history.clone();
+        }
+        let history = Arc::new(History::open(history_path(
+            &data_dir.join("chats").join(key.slug()),
+        )));
+        self.histories.insert(key.clone(), history.clone());
+        self.registry
+            .note_outbound(key, crate::sender::epoch_secs());
+        self.registry.flush();
+        history
     }
 }
 
@@ -203,9 +212,16 @@ impl ChatRouter {
         last_action: Arc<AtomicU64>,
         platform: &'static str,
     ) -> Self {
+        let state = Mutex::new(RouterState {
+            registry: ChatRegistry::load(&shared.data_dir),
+            senders: HashMap::new(),
+            histories: HashMap::new(),
+            threads: HashMap::new(),
+            current: None,
+        });
         Self {
             shared,
-            state: Mutex::new(RouterState::default()),
+            state,
             spoke,
             last_action,
             platform,
@@ -246,6 +262,24 @@ impl ChatRouter {
             .lock()
             .expect("chat router")
             .history(key, &self.shared.data_dir)
+    }
+
+    /// Note `event`'s chat in the durable registry — every inbound event
+    /// refreshes the record's `last_seen` and whatever metadata it carried.
+    pub(crate) fn note_event(&self, event: &ChatEvent) {
+        let mut state = self.state.lock().expect("chat router");
+        state.registry.note_event(event);
+        state.registry.flush();
+    }
+
+    /// Every chat the bot has state for — `list_chats`'s answer.
+    pub fn chats(&self) -> BTreeMap<String, ChatRecord> {
+        self.state
+            .lock()
+            .expect("chat router")
+            .registry
+            .records()
+            .clone()
     }
 
     /// The [`Sender`] bound to `key`, built through the platform factory
@@ -597,8 +631,10 @@ impl ChatActor {
         self.cwd().join("transcript.log")
     }
 
-    /// The IM record of the chat `event` belongs to.
+    /// The IM record of the chat `event` belongs to — and the chat
+    /// registry, so every observed chat stays enumerable across restarts.
     fn log_event(&self, event: &ChatEvent) {
+        self.router.note_event(event);
         self.router.history(&key_of(event)).append_event(event);
     }
 
@@ -1622,6 +1658,11 @@ record grepped: case-insensitive match on text, sender name, and command \
 fields. When you need to recall what was said — before a restart wiped \
 your context or before you ever existed — this is the tool: \"what did we \
 say about X yesterday\" is a `search_history` call, not a guess. \
+- `list_chats` `{}` — every chat the bot has state for: `platform:id` (a \
+valid `chat` argument for any other tool), `type`/`title` when seen, \
+activity times, and observed forum `topics`. No platform lets a bot \
+enumerate its chats, so this is the observed set — a chat appears once \
+an event arrives or a send reaches it. \
 - `chat_info` `{chat}` — look up a chat through your bot identity: \
 numeric id, @username, or t.me link (`t.me/name`, `t.me/c/<id>/<msg>`; \
 invite links cannot resolve). Returns id, type, title, description, \
@@ -1645,8 +1686,10 @@ optional `chat` argument: the `chat` id from an event, or `platform:id`. \
 Omit it and the tool acts on the chat the current events came from — pass \
 it to reach another conversation: carry a group answer into a DM, check a \
 group's `history` while answering a private question, or post into a chat \
-nobody pinged you in. Cross-chat sends are real sends — do them when the \
-user asked for it or the context makes it obviously right, not on a whim.
+nobody pinged you in. `list_chats` enumerates every conversation the bot \
+has state for when you need the map. Cross-chat sends are real sends — \
+do them when the user asked for it or the context makes it obviously \
+right, not on a whim.
 
 **Your context resets; the record doesn't.** Every spawn starts a fresh \
 session — the daemon restarts you on shutdown, `restart`, or a harness \
@@ -1815,6 +1858,7 @@ pub(super) mod tests {
             ts: 0,
             attention: "direct",
             chat_type: Some("private"),
+            chat_title: None,
             message_id: Some(message_id),
             from: crate::chat::EventSender {
                 id: "0".to_string(),
