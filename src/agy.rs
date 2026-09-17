@@ -26,7 +26,7 @@ use aither_acp::{
     SessionNewParams, SessionNewResult, SessionNotification, SessionResumeCapabilities,
     SessionResumeParams, SessionResumeResult, SessionSetConfigOptionParams,
     SessionSetConfigOptionResult, SessionSetModeParams, SessionSetModeResult, SessionUpdate,
-    StopReason, TextContent, ToolCall, ToolCallStatus, ToolCallUpdate,
+    StopReason, TextContent, ToolCall, ToolCallStatus, ToolCallUpdate, ToolKind,
 };
 use aither_mcp::protocol::{
     JsonRpcError, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
@@ -566,15 +566,21 @@ fn step_update(step: &serde_json::Value) -> Option<SessionUpdate> {
         "agent_thought" | "thinking" => text_chunk(step, true),
         "tool" => {
             let id = step.get("step_index")?.as_u64()?.to_string();
+            let name = step
+                .get("tool_name")
+                .and_then(|n| n.as_str())
+                .unwrap_or_default();
+            // Classify agy's command tools so the client's blocked-tool
+            // rule works on `kind` — harness-agnostic — rather than these
+            // agy-specific names.
+            let kind = crate::handler::MAIN_BLOCKED_TOOLS
+                .contains(&name)
+                .then_some(ToolKind::Execute);
             if step.get("state").and_then(|s| s.as_str()) == Some("ACTIVE") {
                 Some(SessionUpdate::ToolCall(ToolCall {
                     tool_call_id: id,
-                    title: step
-                        .get("tool_name")
-                        .and_then(|n| n.as_str())
-                        .unwrap_or_default()
-                        .to_string(),
-                    kind: None,
+                    title: name.to_string(),
+                    kind,
                     status: Some(ToolCallStatus::InProgress),
                     content: Vec::new(),
                     locations: Vec::new(),
@@ -590,7 +596,7 @@ fn step_update(step: &serde_json::Value) -> Option<SessionUpdate> {
                     tool_call_id: id,
                     status: Some(ToolCallStatus::Completed),
                     title: None,
-                    kind: None,
+                    kind,
                     content: None,
                     locations: None,
                     raw_input: None,

@@ -11,19 +11,24 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use aither_acp::{
     ClientHandler, RequestPermissionOutcome, RequestPermissionParams, RequestPermissionResult,
-    SessionNotification, SessionUpdate, ToolCallStatus,
+    SessionNotification, SessionUpdate, ToolCallStatus, ToolKind,
 };
 use aither_mcp::protocol::JsonRpcError;
 use async_channel::Sender as ChanSender;
 use futures_lite::io::AsyncWriteExt;
 use tracing::{debug, warn};
 
-/// Harness tool names that execute shell commands. The shared agent is the
-/// bot's single-threaded UI: a command on its own turn blocks every chat
-/// for the command's duration, so these calls are cancelled the moment the
-/// tool step appears — command work belongs inside subagents, whose tool
-/// calls run in their own conversations and never surface here.
-const MAIN_BLOCKED_TOOLS: &[&str] = &["run_command", "send_command_input", "command_status"];
+/// Harness tool names that execute shell commands but may arrive with no
+/// `kind` classification — the fallback match when a harness leaves
+/// `ToolCall.kind` unset. The primary signal is `kind == Execute`, which
+/// is what a spec-conformant harness (devin's `exec`, and the agy bridge's
+/// translation of `run_command`) reports for command execution. The shared
+/// agent is the bot's single-threaded UI: a command on its own turn blocks
+/// every chat for the command's duration, so these calls are cancelled the
+/// moment the tool step appears — command work belongs inside subagents,
+/// whose tool calls run in their own conversations and never surface here.
+pub(crate) const MAIN_BLOCKED_TOOLS: &[&str] =
+    &["run_command", "send_command_input", "command_status"];
 
 /// Handles agent-to-client traffic for the shared session.
 #[derive(Debug)]
@@ -74,10 +79,13 @@ impl ClientHandler for BotClientHandler {
 
         // A command tool starting on the shared thread: flag it so the
         // turn loop can cancel before the command's duration becomes
-        // every chat's wait. Completed-status updates don't re-report.
+        // every chat's wait. `kind == Execute` is the harness-agnostic
+        // signal; the name list catches harnesses that leave `kind` unset.
+        // Completed-status updates don't re-report.
         if let SessionUpdate::ToolCall(call) = update
             && call.status == Some(ToolCallStatus::InProgress)
-            && MAIN_BLOCKED_TOOLS.contains(&call.title.as_str())
+            && (call.kind == Some(ToolKind::Execute)
+                || MAIN_BLOCKED_TOOLS.contains(&call.title.as_str()))
         {
             let _ = self.blocked_tool.try_send(call.title.clone());
         }
@@ -170,7 +178,9 @@ mod tests {
     }
 
     /// A command tool starting on the shared thread is reported on the
-    /// blocked channel — completion updates and unrelated tools aren't.
+    /// blocked channel — by `kind: Execute` on any name, or by the agy
+    /// name list when `kind` is unset. Completion updates and unrelated
+    /// tools aren't.
     #[test]
     fn blocked_tool_calls_are_flagged_on_start() {
         use aither_acp::ToolCall;
@@ -180,12 +190,12 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             tx,
         );
-        let call = |title: &str, status| SessionNotification {
+        let call = |title: &str, kind: Option<ToolKind>, status| SessionNotification {
             session_id: "s".to_string(),
             update: SessionUpdate::ToolCall(ToolCall {
                 tool_call_id: "1".to_string(),
                 title: title.to_string(),
-                kind: None,
+                kind,
                 status: Some(status),
                 content: Vec::new(),
                 locations: Vec::new(),
@@ -197,11 +207,33 @@ mod tests {
             extra: Default::default(),
         };
 
-        block_on(handler.session_update(call("view_file", ToolCallStatus::InProgress)));
-        block_on(handler.session_update(call("run_command", ToolCallStatus::Completed)));
+        block_on(handler.session_update(call(
+            "view_file",
+            Some(ToolKind::Read),
+            ToolCallStatus::InProgress,
+        )));
+        block_on(handler.session_update(call(
+            "run_command",
+            Some(ToolKind::Execute),
+            ToolCallStatus::Completed,
+        )));
         assert!(rx.is_empty());
 
-        block_on(handler.session_update(call("run_command", ToolCallStatus::InProgress)));
-        assert_eq!(rx.try_recv().as_deref(), Ok("run_command"));
+        // A spec-conformant harness (devin's `exec`) reports the kind —
+        // any name with `Execute` is a command.
+        block_on(handler.session_update(call(
+            "exec",
+            Some(ToolKind::Execute),
+            ToolCallStatus::InProgress,
+        )));
+        assert_eq!(rx.try_recv().as_deref(), Ok("exec"));
+
+        // An unclassified harness still trips on the known names.
+        block_on(handler.session_update(call(
+            "send_command_input",
+            None,
+            ToolCallStatus::InProgress,
+        )));
+        assert_eq!(rx.try_recv().as_deref(), Ok("send_command_input"));
     }
 }

@@ -1651,10 +1651,10 @@ fn blocked_turn_event_text(chat: Option<&ChatKey>, tool: &str) -> String {
         &format!(
             "Your last turn was cancelled — it called `{tool}`, and command \
              execution does not exist on this thread. Send the user a \
-             one-line update, then delegate the work to a subagent \
-             (`invoke_subagent`/`define_subagent`); subagents have their \
-             own command tools. When the subagent finishes, relay its \
-             result to the chat that asked."
+             one-line update, then delegate the work through your subagent \
+             tool; subagents run in their own sessions with the full tool \
+             set. When the subagent finishes, relay its result to the \
+             chat that asked."
         ),
     )
 }
@@ -1934,11 +1934,11 @@ research, builds, multi-step jobs — goes to a subagent run in the \
 background (spawn one with your subagent tool); your turn acks, delegates, \
 and ends. When the subagent finishes, deliver its result to the chat that \
 asked — your `chat` argument names it. This is enforced: command \
-execution does not exist on your thread — calling `run_command` (or its \
-`send_command_input`/`command_status` companions) cancels your whole \
-turn on the spot and re-prompts you as a `nudge`, so a command you run \
-yourself is work thrown away. Subagents run in their own conversations \
-with the full tool set — commands go there.
+execution does not exist on your thread — calling a command tool \
+(`run_command`, `exec`, or whatever your harness names shell execution) \
+cancels your whole turn on the spot and re-prompts you as a `nudge`, so \
+a command you run yourself is work thrown away. Subagents run in their \
+own sessions with the full tool set — commands go there.
 
 # How this works
 
