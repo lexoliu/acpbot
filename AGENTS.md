@@ -88,6 +88,14 @@ must do the same (see `ensure_executor` in test modules).
   tools on the same `chat` MCP endpoint. Stealth by construction — no
   `--enable-automation`, and the client never sends `Runtime.enable`;
   profile persists at `<data_dir>/browser-profile`.
+- `preview.rs` — link previews on inbound text (`[preview]`, on by
+  default): each `http(s)` link in a message is fetched at prompt-assembly
+  time (like `media.file`, so journal replays regenerate it) and attached
+  as `link_previews` — `og:` title/site/description, or the post body for
+  `t.me/<channel>/<post>` links (fetched via the server-rendered `/s/`
+  embed). Per-link timeout + concurrency, a short TTL cache, and a
+  loopback/private-host short-circuit since fetches run on the host
+  network.
 
 ## Conventions
 

@@ -76,6 +76,9 @@ pub struct AgentShared {
     /// Where the actor reports session lifecycle events; the dispatcher
     /// persists them so an unclean exit can be recovered on next run.
     pub session_updates: ChanSender<SessionUpdate>,
+    /// Fetches `link_previews` for links in inbound message text at
+    /// prompt-assembly time (`[preview]`); `None` when disabled.
+    pub previewer: Option<crate::preview::Previewer>,
 }
 
 /// What the actor tells the dispatcher about the live session.
@@ -384,6 +387,7 @@ impl Dispatcher {
         sender_for: SenderFactory,
         sticker_library: Arc<crate::stickerlib::StickerLibrary>,
         browser: crate::config::BrowserConfig,
+        preview: crate::config::PreviewConfig,
         platform: &'static str,
     ) -> Self {
         let (session_updates, session_ids) = async_channel::unbounded();
@@ -399,6 +403,9 @@ impl Dispatcher {
                 sticker_library,
                 sender_for,
                 session_updates,
+                previewer: preview
+                    .enabled
+                    .then(|| crate::preview::Previewer::new(&preview)),
             }),
             platform,
             browser: browser
@@ -896,6 +903,12 @@ impl ChatActor {
                 if let Some(sticker) = &mut reply.sticker {
                     sticker.file = sender.fetch_media(&sticker.file_id, &agent_dir).await?;
                 }
+            }
+            // Same prompt-assembly decoration as the media fetch: links in
+            // the text get their preview attached here, so a journaled
+            // replay regenerates them rather than trusting stale bytes.
+            if let Some(previewer) = &self.shared.previewer {
+                previewer.enrich(event).await;
             }
         }
 
@@ -2083,7 +2096,12 @@ the user rewrote — `text` is the new content. `thread_id` appears when \
 the chat is a forum; your sends follow the current topic automatically. \
 A `nudge` event is the daemon interrupting a silent turn — or re-prompting \
 one that ended without a single chat tool call; its `note` says which. \
-See the ten-second rule above.
+See the ten-second rule above. \
+When `text` carries links, `link_previews` holds the daemon's prefetch of \
+each: `title`/`site`/`text` (a `t.me/<channel>/<post>` link's `text` is \
+the post's own body), or `error` when the page couldn't be previewed. \
+Read them instead of browsing — fetch the page yourself only when you \
+need more than the preview carries.
 
 Media arrive as `sticker` `{file_id, emoji, set_name, format}` or `media` \
 `{kind, file_id}` — resend them with `send_sticker`/`send_file` `file_id`. \
@@ -2232,6 +2250,7 @@ pub(super) mod tests {
             sticker: None,
             media: None,
             reaction: None,
+            link_previews: Vec::new(),
             thread_id: None,
         }
     }
@@ -2393,6 +2412,10 @@ pub(super) mod tests {
                 enabled: false,
                 ..Default::default()
             },
+            crate::config::PreviewConfig {
+                enabled: false,
+                ..Default::default()
+            },
             "telegram",
         );
         let (tx, rx) = async_channel::unbounded();
@@ -2497,6 +2520,7 @@ pub(super) mod tests {
                 Ok(Sender::record(out.clone(), spoke))
             }),
             session_updates: async_channel::unbounded().0,
+            previewer: None,
         });
         (
             Arc::new(ChatRouter::new(
@@ -2698,6 +2722,7 @@ pub(super) mod tests {
             sticker_library: Arc::new(crate::stickerlib::StickerLibrary::load(&dir, None).unwrap()),
             sender_for: Box::new(|_, _, _, _| Err(SenderError::Other("unused".to_string()))),
             session_updates: async_channel::unbounded().0,
+            previewer: None,
         };
         let bridge_args = vec!["mcp-bridge".to_string(), "x.sock".to_string()];
         prepare_chat_dir(&cwd, "acpbot", &bridge_args, &shared).unwrap();

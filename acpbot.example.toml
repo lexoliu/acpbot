@@ -107,6 +107,16 @@ kind = "native"
 # profile_dir = "~/.local/share/acpbot/browser-profile"
 # args = []         # extra Chrome flags, e.g. ["--proxy-server=..."] — never automation flags
 
+# [preview]
+# Links in inbound message text get a daemon-fetched preview attached to
+# the event (`link_previews`) — title/site/description, or the post body
+# for t.me/<channel>/<post> links — so the agent reads it instead of
+# fetching the page itself. Loopback/private hosts and private Telegram
+# links are never fetched.
+# enabled = true
+# timeout_secs = 8    # per-link fetch timeout
+# max_links = 3       # per message
+
 # [paths]
 # Root for the shared agent working dir, per-chat transcripts, the session
 # registry, and IPC sockets. Default: ~/.local/share/acpbot

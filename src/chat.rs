@@ -128,6 +128,29 @@ pub struct EventMedia {
     pub file: Option<EventFile>,
 }
 
+/// The daemon's prefetch of a link in the message `text`: the page's
+/// title and description — or a Telegram post's body — so the agent
+/// usually doesn't need to fetch the URL itself.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventLinkPreview {
+    /// The link exactly as it appeared in the text.
+    pub url: String,
+    /// The site's name (`og:site_name`), when the page reports one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub site: Option<String>,
+    /// The page title (`og:title`, falling back to `<title>`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// The page description (`og:`/`<meta>`), or the post's own text for
+    /// `t.me/<channel>/<post>` links.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// Why there is no preview — a fetch failure, a non-HTML body, or an
+    /// un-previewable link (private Telegram URLs, loopback hosts).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 /// A reaction change on a message (`type == "reaction"`): what the user
 /// added and removed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -197,6 +220,11 @@ pub struct ChatEvent {
     /// message reacted to.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reaction: Option<EventReaction>,
+    /// Daemon-fetched previews of links in `text` (see
+    /// [`EventLinkPreview`]); absent when the message has no links or
+    /// `[preview] enabled = false`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub link_previews: Vec<EventLinkPreview>,
     /// Forum topic the event arrived in, when the chat has topics. Outbound
     /// sends follow the current topic automatically.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -294,6 +322,7 @@ mod tests {
             }),
             media: None,
             reaction: None,
+            link_previews: Vec::new(),
             thread_id: None,
         };
         let json = base.to_prompt_text();
@@ -375,6 +404,7 @@ mod tests {
             sticker: None,
             media: None,
             reaction: None,
+            link_previews: Vec::new(),
             thread_id: Some(12),
         };
         let text = event.to_prompt_text();
@@ -408,6 +438,7 @@ mod tests {
             sticker: None,
             media: None,
             reaction: None,
+            link_previews: Vec::new(),
             thread_id: None,
         };
         assert!(base.is_stop());
