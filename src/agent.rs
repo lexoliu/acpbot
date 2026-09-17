@@ -502,6 +502,7 @@ impl Dispatcher {
         let (spoke_tx, spoke_rx) = async_channel::bounded(1);
         let last_action = Arc::new(AtomicU64::new(crate::sender::epoch_ms()));
         let (restart_tx, restart_rx) = async_channel::unbounded();
+        let (blocked_tx, blocked_rx) = async_channel::unbounded();
         let actor = ChatActor {
             shared: self.shared.clone(),
             router: Arc::new(ChatRouter::new(
@@ -519,6 +520,8 @@ impl Dispatcher {
             compact_supported: Arc::new(AtomicBool::new(false)),
             session_turns: 0,
             spoke_rx,
+            blocked_rx,
+            blocked_tx,
             last_action,
             restart_tx,
             restart_rx,
@@ -593,6 +596,12 @@ struct ChatActor {
     /// Drained per turn to stop the typing indicator on the first send;
     /// every sender posts to its sender half.
     spoke_rx: Receiver<()>,
+    /// Fires when the session reports a command-tool call on the shared
+    /// thread — `run_command` & friends belong inside subagents, so the
+    /// turn is cancelled and re-prompted. The sender half is cloned into
+    /// each respawned `BotClientHandler`.
+    blocked_rx: Receiver<String>,
+    blocked_tx: ChanSender<String>,
     /// Epoch ms of the agent's last outbound action — every sender writes
     /// it through `spoke`; the nudge watchdog reads it to measure silence.
     last_action: Arc<AtomicU64>,
@@ -907,23 +916,34 @@ impl ChatActor {
             debug_turn_end(result);
         }
 
-        // A direct question whose turn ends with no outbound action almost
-        // always means the model wrote its reply as plain text — discarded,
-        // never seen. Re-prompt with a nudge naming the failure, a bounded
-        // number of times; each re-prompt is itself watchdogged.
+        // Two failure shapes re-prompt with a nudge naming the failure,
+        // sharing one bounded budget; each re-prompt is itself watchdogged:
+        // a turn cancelled for calling a command tool on the shared thread
+        // (command work belongs to subagents), and a direct question whose
+        // turn ended with no outbound action at all (the model wrote its
+        // reply as plain text — discarded, never seen).
         let mut retries = SILENT_TURN_NUDGES;
-        while wants_answer
-            && matches!(end, PromptEnd::Done(_))
-            && retries > 0
-            && self.last_action.load(Ordering::Relaxed) == spoke_at_start
-        {
+        loop {
+            let nudge_text = match &end {
+                PromptEnd::Blocked(tool) if retries > 0 => {
+                    blocked_turn_event_text(self.router.current().as_ref(), tool)
+                }
+                PromptEnd::Done(_)
+                    if wants_answer
+                        && retries > 0
+                        && self.last_action.load(Ordering::Relaxed) == spoke_at_start =>
+                {
+                    warn!(
+                        chat = ?self.router.current(),
+                        "turn ended with no chat output; nudging the agent"
+                    );
+                    silent_turn_event_text(self.router.current().as_ref())
+                }
+                _ => break,
+            };
             retries -= 1;
-            warn!(
-                chat = ?self.router.current(),
-                "turn ended with no chat output; nudging the agent"
-            );
             let nudge = vec![ContentBlock::Text(TextContent {
-                text: silent_turn_event_text(self.router.current().as_ref()),
+                text: nudge_text,
                 annotations: None,
                 meta: None,
             })];
@@ -947,7 +967,7 @@ impl ChatActor {
         }
 
         let outcome = match end {
-            PromptEnd::Done(_) | PromptEnd::Stopped => Ok(()),
+            PromptEnd::Done(_) | PromptEnd::Stopped | PromptEnd::Blocked(_) => Ok(()),
             PromptEnd::Shutdown => unreachable!("shutdown returns above"),
         };
 
@@ -994,6 +1014,9 @@ impl ChatActor {
         let mut prompt: Pin<
             Box<dyn Future<Output = Result<PromptResult, ClientError>> + Send + '_>,
         > = Box::pin(client.prompt(PromptParams::new(session_id, content)));
+        // Blocked-tool reports from a dead turn are stale; this prompt's
+        // calls start reporting once it is in flight.
+        while self.blocked_rx.try_recv().is_ok() {}
         // Once `rx` closes no event can ever arrive — drop the arm rather
         // than spin on instant `Err`s.
         let mut events_open = true;
@@ -1004,6 +1027,7 @@ impl ChatActor {
                 Tick,
                 Event(Box<ChatEvent>),
                 EventsClosed,
+                Blocked(String),
             }
             let done = async { Race::Done(prompt.as_mut().await) };
             let wait = async {
@@ -1029,9 +1053,17 @@ impl ChatActor {
                     Err(_) => Race::EventsClosed,
                 }
             };
+            let blocked = async {
+                match self.blocked_rx.recv().await {
+                    Ok(tool) => Race::Blocked(tool),
+                    // The actor owns the sender; a closed channel is a
+                    // dead arm, not a signal — never busy-loop on it.
+                    Err(_) => std::future::pending().await,
+                }
+            };
             let race = futures_lite::future::or(
                 futures_lite::future::or(done, wait),
-                futures_lite::future::or(tick, incoming),
+                futures_lite::future::or(tick, futures_lite::future::or(incoming, blocked)),
             )
             .await;
             match race {
@@ -1084,6 +1116,18 @@ impl ChatActor {
                         })],
                     )));
                 }
+                Race::Blocked(tool) => {
+                    warn!(
+                        chat = ?self.router.current(),
+                        tool, "command tool on the shared thread; cancelling turn"
+                    );
+                    cancel_and_settle(client, session_id, &mut prompt).await;
+                    // Reports can still land while the cancellation
+                    // settles — drop them so the caller's re-prompt
+                    // doesn't trip over a dead turn's calls.
+                    while self.blocked_rx.try_recv().is_ok() {}
+                    return Ok(PromptEnd::Blocked(tool));
+                }
             }
         }
     }
@@ -1122,7 +1166,11 @@ impl ChatActor {
         // The new session will re-advertise its commands; don't trust a
         // previous process's `compact` in the meantime.
         self.compact_supported.store(false, Ordering::Relaxed);
-        let handler = BotClientHandler::new(self.transcript_path(), self.compact_supported.clone());
+        let handler = BotClientHandler::new(
+            self.transcript_path(),
+            self.compact_supported.clone(),
+            self.blocked_tx.clone(),
+        );
         let spawned = self
             .runtime
             .as_ref()
@@ -1522,6 +1570,9 @@ enum PromptEnd {
     Shutdown,
     /// A `stop` event cancelled the turn mid-flight.
     Stopped,
+    /// The turn was cancelled because the agent invoked a command tool on
+    /// the shared thread — the payload names the tool it called.
+    Blocked(String),
 }
 
 /// Cancel the in-flight prompt and give the wire a bounded moment to
@@ -1588,6 +1639,23 @@ fn silent_turn_event_text(chat: Option<&ChatKey>) -> String {
         "Your last turn ended with no chat output — anything you wrote as \
          plain text was discarded and the user is still waiting. Answer \
          again through a `chat` tool call (`send_message`/`reply`).",
+    )
+}
+
+/// The `nudge` injected when the turn was cancelled because the agent
+/// invoked a command tool on the shared thread: while a command runs on
+/// your turn every chat waits, so the harness kills the whole turn.
+fn blocked_turn_event_text(chat: Option<&ChatKey>, tool: &str) -> String {
+    nudge_event(
+        chat,
+        &format!(
+            "Your last turn was cancelled — it called `{tool}`, and command \
+             execution does not exist on this thread. Send the user a \
+             one-line update, then delegate the work to a subagent \
+             (`invoke_subagent`/`define_subagent`); subagents have their \
+             own command tools. When the subagent finishes, relay its \
+             result to the chat that asked."
+        ),
     )
 }
 
@@ -1865,7 +1933,12 @@ and dispatching, not for grinding: anything beyond a quick answer — \
 research, builds, multi-step jobs — goes to a subagent run in the \
 background (spawn one with your subagent tool); your turn acks, delegates, \
 and ends. When the subagent finishes, deliver its result to the chat that \
-asked — your `chat` argument names it.
+asked — your `chat` argument names it. This is enforced: command \
+execution does not exist on your thread — calling `run_command` (or its \
+`send_command_input`/`command_status` companions) cancels your whole \
+turn on the spot and re-prompts you as a `nudge`, so a command you run \
+yourself is work thrown away. Subagents run in their own conversations \
+with the full tool set — commands go there.
 
 # How this works
 
@@ -2032,6 +2105,12 @@ pub(super) mod tests {
         let mid: serde_json::Value = serde_json::from_str(&nudge_event_text(Some(&key))).unwrap();
         assert_eq!(mid["type"], "nudge");
         assert!(mid["note"].as_str().unwrap().contains("silent too long"));
+
+        let blocked: serde_json::Value =
+            serde_json::from_str(&blocked_turn_event_text(Some(&key), "run_command")).unwrap();
+        assert_eq!(blocked["type"], "nudge");
+        let note = blocked["note"].as_str().unwrap();
+        assert!(note.contains("run_command") && note.contains("subagent"));
     }
 
     /// Wait until the transcript stops growing for `quiet` — the only

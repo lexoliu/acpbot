@@ -100,7 +100,11 @@ every chat waits. Keep the main turn short — ack, hand the task to a
 background subagent, end the turn; relay the result to the asking chat when
 the subagent reports back. Tooling, prompts, and the managed `AGENTS.md`
 block (`PROTOCOL_DOC` in `agent.rs`) all tune toward that: work happens in
-subagents, the main turn only talks and dispatches.
+subagents, the main turn only talks and dispatches. It is also enforced —
+`BotClientHandler` flags `run_command`/`send_command_input`/`command_status`
+the moment one starts on the shared thread (subagent calls run in their own
+conversations and never surface here), the turn is cancelled and re-prompted
+as a `nudge`, bounded by the same retry budget as the silent-turn recovery.
 
 ## Config
 
