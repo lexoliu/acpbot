@@ -51,6 +51,14 @@ must do the same (see `ensure_executor` in test modules).
   records, never as an inbound event.
 - `mcpserver.rs`, `bridge.rs`, `sandbox.rs` — the chat-tools MCP endpoint and
   the isolation runtimes (`native` heel, `docker`, `bare`).
+- `agy.rs` — `acpbot agy-bridge`: an ACP server over stdio that fronts the
+  Antigravity `agy` CLI (`[agent] command = "<acpbot>", args = ["agy-bridge"]`).
+  agy runs one `stream-json` process per turn; the bridge threads its
+  `conversation_id` via `--conversation` and persists the `acp session id →
+  conversation id` map at `<cwd>/.agy-bridge.json` so `session/load` can
+  still recover a session for the continuity handoff. Chat tools reach agy
+  through its global `~/.gemini/config/mcp_config.json`, mirrored from the
+  session's `.devin/mcp_config.json`. Requires `isolation.kind = "none"`.
 - `history.rs` — `history.jsonl` per chat: the durable IM record, not an
   agent transcript — inbound events appended by the actor, outbound actions
   by `Sender`, read back by the `history` and `search_history` tools

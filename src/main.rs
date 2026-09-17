@@ -7,6 +7,7 @@
 //! (`acpbot mcp-bridge` is the stdio↔socket link the agent spawns).
 
 mod agent;
+mod agy;
 mod bot;
 mod bridge;
 mod chat;
@@ -53,6 +54,7 @@ fn main() -> Result<(), MainError> {
             };
             bridge::run(target).map_err(MainError::from)
         }
+        Some("agy-bridge") => agy::run().map_err(MainError::from),
         Some("run") => {
             let config = match args.as_slice() {
                 [_, flag, path] if flag == "--config" => PathBuf::from(path),
@@ -66,7 +68,7 @@ fn main() -> Result<(), MainError> {
             run(&config)
         }
         _ => Err(MainError::Usage(
-            "usage: acpbot run [--config PATH] | acpbot mcp-bridge              <socket|tcp:HOST:PORT|ipc:COMMAND>"
+            "usage: acpbot run [--config PATH] | acpbot mcp-bridge <socket|tcp:HOST:PORT|ipc:COMMAND> | acpbot agy-bridge"
                 .to_string(),
         )),
     }

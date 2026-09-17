@@ -1561,8 +1561,10 @@ const PROTOCOL_DOC: &str = "\
 **Your ordinary text output is invisible.** Everything you write is logged to \
 a transcript file and thrown away — the people in the chat never see it. The \
 ONLY way to communicate is to call a tool on the MCP server named `chat` \
-(the tools appear as `mcp__chat__*`; `mcp_list_tools` with `server_name` = \
-`chat` shows their schemas):
+(on devin the tools appear as `mcp__chat__*` and `mcp_list_tools` with \
+`server_name` = `chat` shows their schemas; on harnesses with a generic \
+MCP dispatcher — Antigravity's `call_mcp_tool` — use `ServerName: \"chat\"` \
+with the tool name below):
 
 - `send_message` `{text, buttons?, chat?}` — post a new message. Every call \
 arrives as one complete, separately-visible message: compose the full \
