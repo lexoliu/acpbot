@@ -213,6 +213,7 @@ fn run(config_path: &Path) -> Result<(), MainError> {
         config.persona.clone(),
         sender_for,
         sticker_library,
+        config.platform.name(),
     );
     // Kept, not detached: on shutdown the dispatcher's drop chain is what
     // kills the shared agent process (a heel sandbox kills on drop).

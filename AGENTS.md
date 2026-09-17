@@ -32,9 +32,11 @@ must do the same (see `ensure_executor` in test modules).
 - `chat.rs` — `ChatEvent`, the JSON schema the agent sees; it is documented
   again in the agent's `AGENTS.md` managed block, so the two never drift.
 - `agent.rs` — `Dispatcher` + the single shared `ChatActor` + `ChatRouter`:
-  spawns the ACP process, always opens a *fresh* session (`session/new`)
-  and injects the previous incarnation's `CONTINUITY.md` as the bootstrap
-  prompt; before a clean close it asks the agent to (re)write that file.
+  spawns the ACP process at daemon start (process, handshake, `session/new`,
+  and the continuity inject are all paid before the first event arrives),
+  always opens a *fresh* session and injects the previous incarnation's
+  `CONTINUITY.md` as the bootstrap prompt; before a clean close it asks
+  the agent to (re)write that file.
   A session id in `sessions.json` is a "died before handoff" marker — the
   next spawn restores it only to extract the summary, never to resume.
   Forwards event batches as prompts, runs the first-reply watchdog and

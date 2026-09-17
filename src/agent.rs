@@ -349,8 +349,12 @@ impl ChatRouter {
 /// Forwards every chat's events to the one shared agent actor.
 pub struct Dispatcher {
     shared: Arc<AgentShared>,
-    /// The shared actor's queue and task — spawned on the first event,
-    /// respawned if its run loop ever ends early.
+    /// The platform tag of the daemon's transport — events carry it, and
+    /// it seeds the actor's router before any event has arrived.
+    platform: &'static str,
+    /// The shared actor's queue and task — spawned at startup so process
+    /// bring-up and the continuity inject are paid before the first
+    /// event, and respawned if its run loop ever ends early.
     actor: Option<(ChanSender<ChatEvent>, executor_core::AnyExecutorTask<()>)>,
     /// `sessions.json` — slug → session id. The live session sits under
     /// [`SHARED_SLUG`]; per-chat slugs remain only for the upgrade handoff.
@@ -373,6 +377,7 @@ impl Dispatcher {
         persona: Option<String>,
         sender_for: SenderFactory,
         sticker_library: Arc<crate::stickerlib::StickerLibrary>,
+        platform: &'static str,
     ) -> Self {
         let (session_updates, session_ids) = async_channel::unbounded();
         let known_sessions = load_sessions(&data_dir);
@@ -388,6 +393,7 @@ impl Dispatcher {
                 sender_for,
                 session_updates,
             }),
+            platform,
             actor: None,
             known_sessions,
             session_ids,
@@ -397,6 +403,18 @@ impl Dispatcher {
 
     /// Consume events forever, forwarding each to the shared actor.
     pub async fn run(mut self, events: Receiver<ChatEvent>) {
+        // Warm the agent now — process spawn, the ACP handshake, and the
+        // continuity inject are all paid before the first event so that
+        // event's turn is just the model. Events arriving during warm-up
+        // queue on the actor's channel. A `shared` session id marks a
+        // session that never handed off; a stray per-chat slug left by the
+        // pre-shared layout is still a handoff candidate.
+        let session_id = self
+            .known_sessions
+            .get(SHARED_SLUG)
+            .or_else(|| self.known_sessions.values().next())
+            .cloned();
+        self.spawn_actor(session_id);
         loop {
             // `race`, not `or`: `or` keeps waiting on the other arm after an
             // `Err`, and `session_ids` never closes (its sender lives in
@@ -458,7 +476,7 @@ impl Dispatcher {
             return;
         }
 
-        // No actor yet (or it died): spawn the shared one. A session id
+        // The actor's run loop ended early — respawn it. A session id
         // under `shared` — or, on upgrade from the per-chat layout, the
         // triggering chat's slug — marks a session that never handed off;
         // the actor restores it only to extract CONTINUITY.md before
@@ -469,7 +487,15 @@ impl Dispatcher {
             .get(SHARED_SLUG)
             .or_else(|| self.known_sessions.get(&key.slug()))
             .cloned();
+        let tx = self.spawn_actor(session_id);
+        if tx.send(event).await.is_err() {
+            error!("shared agent actor refused an event after respawn");
+        }
+    }
 
+    /// Spawn the shared actor task and store its queue. `session_id` is
+    /// the recovery marker for a session that died before handing off.
+    fn spawn_actor(&mut self, session_id: Option<String>) -> ChanSender<ChatEvent> {
         let (tx, rx) = async_channel::unbounded();
         // Capacity 1: a full channel is the "the agent already spoke
         // this turn" flag, and the drain at turn start resets it.
@@ -482,7 +508,7 @@ impl Dispatcher {
                 self.shared.clone(),
                 spoke_tx,
                 last_action.clone(),
-                key.platform,
+                self.platform,
             )),
             client: None,
             session_id,
@@ -500,9 +526,7 @@ impl Dispatcher {
         };
         let task = executor_core::spawn(actor.run(rx));
         self.actor = Some((tx.clone(), task));
-        if tx.send(event).await.is_err() {
-            error!("shared agent actor refused its first event");
-        }
+        tx
     }
 }
 
@@ -643,6 +667,13 @@ impl ChatActor {
     }
 
     async fn run(mut self, rx: Receiver<ChatEvent>) {
+        // Spawned at daemon start: bring the process, ACP session, and
+        // continuity inject up before the first event so its turn only
+        // pays for the model. A warm-up failure isn't fatal — `turn`
+        // retries `ensure_ready` per event.
+        if let Err(error) = self.ensure_ready().await {
+            warn!(%error, "agent warm-up failed");
+        }
         // `true` once this quiet stretch already spent its one compaction —
         // stays set until the next event arrives so idle time never stacks
         // repeated compactions.
@@ -2060,6 +2091,7 @@ pub(super) mod tests {
             None,
             Box::new(move |_, spoke, _, _| Ok(Sender::record(out_tx.clone(), spoke))),
             Arc::new(crate::stickerlib::StickerLibrary::load(&data_dir, None).unwrap()),
+            "telegram",
         );
         let (tx, rx) = async_channel::unbounded();
         executor_core::spawn(dispatcher.run(rx)).detach();
