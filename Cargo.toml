@@ -43,4 +43,3 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 jiff = "0.2.37"
 async-process = "2"
 async-tungstenite = { version = "0.31", default-features = false, features = ["handshake", "futures-03-sink"] }
-futures-util = { version = "0.3", default-features = false, features = ["sink"] }
