@@ -763,22 +763,24 @@ impl Sender {
 
     /// Download the platform file `file_id` points to into `inbox/` inside
     /// `chat_dir`, named by the id so repeat events hit the disk cache.
-    /// Returns the path relative to `chat_dir` plus the guessed MIME type —
-    /// `None` when no local copy can be produced (Telegram's `getFile`
-    /// refuses expired or >20MB files; a CLI path may not exist). The event
-    /// still arrives, just without a local file.
+    /// Returns the absolute path plus the guessed MIME type — `None` when
+    /// no local copy can be produced (Telegram's `getFile` refuses expired
+    /// or >20MB files; a CLI path may not exist). The event still arrives,
+    /// just without a local file.
+    ///
+    /// The path stays absolute rather than `inbox/…`-relative: every
+    /// runtime mounts the chat dir at its own path (docker binds `cwd` to
+    /// the same absolute path), and harness file tools differ on relative
+    /// resolution — agy's `view_file` wants an `AbsolutePath`, so only the
+    /// absolute form works for everyone.
     pub async fn fetch_media(
         &self,
         file_id: &str,
         chat_dir: &Path,
     ) -> Result<Option<EventFile>, SenderError> {
         let inbox = chat_dir.join("inbox");
-        let relative = |abs: &Path| EventFile {
-            path: abs
-                .strip_prefix(chat_dir)
-                .expect("fetched file lives under chat_dir")
-                .to_string_lossy()
-                .into_owned(),
+        let absolute = |abs: &Path| EventFile {
+            path: abs.to_string_lossy().into_owned(),
             mime: mime_guess::from_path(abs)
                 .first_or_octet_stream()
                 .to_string(),
@@ -809,7 +811,7 @@ impl Sender {
                     })
                     .map(|entry| entry.path());
                 if let Some(abs) = cached {
-                    return Ok(Some(relative(&abs)));
+                    return Ok(Some(absolute(&abs)));
                 }
                 let file = match inner.client.get_file(file_id).await {
                     Ok(file) => file,
@@ -836,7 +838,7 @@ impl Sender {
                 };
                 async_fs::create_dir_all(abs.parent().expect("inbox/… has a parent")).await?;
                 async_fs::write(&abs, &bytes).await?;
-                Ok(Some(relative(&abs)))
+                Ok(Some(absolute(&abs)))
             }
             Platform::Cli(_) => {
                 // The wire "file id" is a local path. Copy it into inbox/
@@ -858,7 +860,7 @@ impl Sender {
                         return Ok(None);
                     }
                 }
-                Ok(Some(relative(&abs)))
+                Ok(Some(absolute(&abs)))
             }
             Platform::Discord(inner) => {
                 // `file_id` is the attachment's CDN URL; its filename is
@@ -879,7 +881,7 @@ impl Sender {
                     async_fs::create_dir_all(&inbox).await?;
                     async_fs::write(&abs, &bytes).await?;
                 }
-                Ok(Some(relative(&abs)))
+                Ok(Some(absolute(&abs)))
             }
             #[cfg(test)]
             Platform::Record(_) => Ok(None),

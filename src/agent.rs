@@ -91,7 +91,7 @@ pub enum SessionUpdate {
     Closed,
 }
 
-/// Media above this many bytes stays an `inbox/` path in the event JSON
+/// Media above this many bytes stays an `inbox/` file path in the event JSON
 /// rather than also being inlined as an `image`/`audio` content block —
 /// keeps a huge attachment from dominating the prompt.
 const MEDIA_INLINE_LIMIT: u64 = 8 * 1024 * 1024;
@@ -763,7 +763,7 @@ impl ChatActor {
             if !is_image && !is_audio {
                 continue;
             }
-            let bytes = async_fs::read(agent_dir.join(&file.path)).await?;
+            let bytes = async_fs::read(&file.path).await?;
             if bytes.len() as u64 > MEDIA_INLINE_LIMIT {
                 continue;
             }
@@ -1747,8 +1747,10 @@ Media arrive as `sticker` `{file_id, emoji, set_name, format}` or `media` \
 A `reply_to` can carry the same `sticker`/`media` shape — what the quoted \
 message held, not just its text. \
 The file also downloads into `inbox/` inside your working directory: \
-`media.file`/`sticker.file` gives `{path, mime}` (e.g. \
-`inbox/CAACAgE….jpg`, `image/jpeg`) — open it with your file tools. \
+`media.file`/`sticker.file` gives `{path, mime}` — `path` is absolute \
+(e.g. `/…/chats/shared/inbox/CAACAgE….jpg`, `image/jpeg`), so open it \
+with your file tools exactly as given; do not resolve it yourself — \
+harnesses that default relative paths elsewhere would miss the file. \
 When your client declared `image`/`audio` prompt support, those payloads \
 also reach you as native `image`/`audio` content blocks. Otherwise the \
 file is yours: inspect it, extract frames or waveforms with ffmpeg, or \
