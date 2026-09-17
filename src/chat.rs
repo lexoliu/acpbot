@@ -62,6 +62,14 @@ pub struct EventReplyRef {
     /// Its text, when known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    /// A sticker the referenced message carried, when the platform
+    /// includes the replied message in full.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sticker: Option<EventSticker>,
+    /// Media the referenced message carried, when the platform includes
+    /// the replied message in full.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media: Option<EventMedia>,
 }
 
 /// Command details for `type == "command"`.
@@ -219,14 +227,28 @@ impl ChatEvent {
     /// Every local copy this event's media/sticker downloaded to, so the
     /// actor can inline image payloads as `image` content blocks.
     pub fn files(&self) -> impl Iterator<Item = &EventFile> {
-        self.media
+        let top = self
+            .media
             .iter()
             .filter_map(|media| media.file.as_ref())
             .chain(
                 self.sticker
                     .iter()
                     .filter_map(|sticker| sticker.file.as_ref()),
-            )
+            );
+        let replied = self.reply_to.iter().flat_map(|reply| {
+            reply
+                .media
+                .iter()
+                .filter_map(|media| media.file.as_ref())
+                .chain(
+                    reply
+                        .sticker
+                        .iter()
+                        .filter_map(|sticker| sticker.file.as_ref()),
+                )
+        });
+        top.chain(replied)
     }
 }
 
