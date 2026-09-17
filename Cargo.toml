@@ -41,3 +41,5 @@ mime_guess = "2.0.5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 jiff = "0.2.37"
+async-process = "2"
+async-tungstenite = { version = "0.31", default-features = false, features = ["handshake", "futures-03-sink"] }

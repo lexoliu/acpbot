@@ -257,6 +257,34 @@ pub enum MainError {
     Usage(String),
 }
 
+/// The daemon-hosted browser (`browser.rs`, `cdp.rs`) failed to launch,
+/// connect, or answer a command. Surfaced to the model as a tool error —
+/// the daemon runs on without working browser calls.
+#[derive(Debug, thiserror::Error)]
+pub enum BrowserError {
+    /// No Chrome-family executable found and none configured.
+    #[error("no Chrome/Chromium found — install Google Chrome or set [browser] executable")]
+    NoExecutable,
+    /// Spawning Chrome or touching its profile/artifact dirs failed.
+    #[error(transparent)]
+    Io(#[from] io::Error),
+    /// The DevTools websocket handshake failed.
+    #[error("devtools handshake: {0}")]
+    Handshake(String),
+    /// A CDP command returned an error, or a response was malformed.
+    #[error("cdp: {0}")]
+    Protocol(String),
+    /// A CDP command (or Chrome startup) didn't answer in time.
+    #[error("cdp timeout: {0}")]
+    Timeout(String),
+    /// The DevTools socket closed mid-call — the browser is gone.
+    #[error("browser connection lost")]
+    WentAway,
+    /// Sending a websocket frame failed.
+    #[error("ws send: {0}")]
+    Send(#[from] Box<async_tungstenite::tungstenite::Error>),
+}
+
 /// A shared-actor operation failed.
 #[derive(Debug, thiserror::Error)]
 pub enum AgentError {

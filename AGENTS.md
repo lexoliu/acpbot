@@ -82,6 +82,12 @@ must do the same (see `ensure_executor` in test modules).
 - `stickerlib.rs` — the persistent catalog of foreign sticker sets
   (`sticker_library.json` under `data_dir`): a bot may send any hosted
   sticker by `file_id`, so importing a set only needs `getStickerSet` once.
+- `browser.rs`, `cdp.rs` — the daemon-hosted browser (`[browser]`, on by
+  default): one real Chrome launched lazily and driven over a hand-rolled
+  CDP client, shared by the main session and subagents through `browser_*`
+  tools on the same `chat` MCP endpoint. Stealth by construction — no
+  `--enable-automation`, and the client never sends `Runtime.enable`;
+  profile persists at `<data_dir>/browser-profile`.
 
 ## Conventions
 

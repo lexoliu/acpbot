@@ -350,6 +350,11 @@ impl ChatRouter {
 /// Forwards every chat's events to the one shared agent actor.
 pub struct Dispatcher {
     shared: Arc<AgentShared>,
+    /// The daemon-hosted browser — one Chrome driven over CDP, shared by
+    /// every bridge connection (main session and subagents alike).
+    /// `None` when `[browser] enabled = false`. Chrome itself launches
+    /// lazily on the first `browser_*` call.
+    browser: Option<crate::browser::Browser>,
     /// The platform tag of the daemon's transport — events carry it, and
     /// it seeds the actor's router before any event has arrived.
     platform: &'static str,
@@ -378,6 +383,7 @@ impl Dispatcher {
         persona: Option<String>,
         sender_for: SenderFactory,
         sticker_library: Arc<crate::stickerlib::StickerLibrary>,
+        browser: crate::config::BrowserConfig,
         platform: &'static str,
     ) -> Self {
         let (session_updates, session_ids) = async_channel::unbounded();
@@ -387,7 +393,7 @@ impl Dispatcher {
             shared: Arc::new(AgentShared {
                 agent,
                 bridge_bin,
-                data_dir,
+                data_dir: data_dir.clone(),
                 sticker_dir,
                 persona,
                 sticker_library,
@@ -395,6 +401,9 @@ impl Dispatcher {
                 session_updates,
             }),
             platform,
+            browser: browser
+                .enabled
+                .then(|| crate::browser::Browser::new(browser, data_dir.clone())),
             actor: None,
             known_sessions,
             session_ids,
@@ -515,6 +524,7 @@ impl Dispatcher {
             client: None,
             session_id,
             mcp_endpoint: None,
+            browser: self.browser.clone(),
             runtime: None,
             child: None,
             prompt_caps: PromptCapabilities::default(),
@@ -591,6 +601,10 @@ struct ChatActor {
     /// The bound MCP endpoint — socket path on unix, loopback TCP where
     /// unix sockets don't exist, docker's gateway TCP for `docker`.
     mcp_endpoint: Option<crate::mcpserver::ChatEndpoint>,
+    /// The daemon-hosted browser whose `browser_*` tools every bridge
+    /// connection also serves. Owned by the `Dispatcher`, so an actor
+    /// respawn keeps the live browser.
+    browser: Option<crate::browser::Browser>,
     /// The agent's isolation runtime (sandbox/container), once created.
     runtime: Option<AgentRuntime>,
     /// The sandboxed child handle of the current agent process, if any.
@@ -1334,7 +1348,14 @@ impl ChatActor {
         let make_tools = {
             let router = self.router.clone();
             let restart = self.restart_tx.clone();
-            move || crate::tools::chat_tools(router.clone(), restart.clone())
+            let browser = self.browser.clone();
+            move || {
+                let mut tools = crate::tools::chat_tools(router.clone(), restart.clone());
+                if let Some(browser) = &browser {
+                    browser.register_into(&mut tools);
+                }
+                tools
+            }
         };
         match &self.shared.agent.isolation {
             AgentIsolation::Docker(_) => Ok(mcpserver::bind_docker_endpoint(make_tools).await?),
@@ -1932,7 +1953,22 @@ the copy. `chat` is the SOURCE; a message link supplies `message_id`. \
 Chats the bot isn't in cannot answer — ask the user to add the bot. \
 - `restart` `{}` — reincarnate your process after editing AGENTS.md or \
 adding skills. The next spawn is a FRESH session: anything the next you \
-must remember goes in AGENTS.md or CONTINUITY.md before you call it.
+must remember goes in AGENTS.md or CONTINUITY.md before you call it. \
+- `browser_*` — the daemon hosts a shared browser (real Chrome driven \
+over CDP with no automation flags — it reads as a human's browser) on \
+this same `chat` server: `browser_navigate`, `browser_snapshot` \
+(accessibility tree — your eyes; interact via the [eN] refs), \
+`browser_click`, `browser_type`, `browser_press_key`, `browser_hover`, \
+`browser_scroll`, `browser_evaluate` (JS in an isolated world), \
+`browser_screenshot`, `browser_wait_for`, `browser_tabs`, \
+`browser_navigate_back`, `browser_console`, `browser_network`, \
+`browser_close`. One browser, persistent profile: pages, logins, and \
+cookies survive your turns and reincarnations, and subagents see the \
+same browser. Sites may still refuse automation (Cloudflare & friends \
+judge more than fingerprints) — respect a wall that says no; never try \
+to defeat CAPTCHAs or access controls. Quick lookups are fine on this \
+thread; hand long browsing sessions to `invoke_subagent` so you keep \
+talking.
 
 **One session, every chat.** All of the bot's conversations share this one \
 agent: events from every chat arrive here, and `platform` + `chat` on each \
@@ -2353,6 +2389,10 @@ pub(super) mod tests {
             None,
             Box::new(move |_, spoke, _, _| Ok(Sender::record(out_tx.clone(), spoke))),
             Arc::new(crate::stickerlib::StickerLibrary::load(&data_dir, None).unwrap()),
+            crate::config::BrowserConfig {
+                enabled: false,
+                ..Default::default()
+            },
             "telegram",
         );
         let (tx, rx) = async_channel::unbounded();

@@ -19,6 +19,9 @@ pub struct Config {
     pub paths: PathsConfig,
     /// Optional persona text injected into the shared `AGENTS.md`.
     pub persona: Option<String>,
+    /// The daemon-hosted stealth browser (`[browser]`).
+    #[serde(default)]
+    pub browser: BrowserConfig,
 }
 
 /// Which chat platform to connect to, and its credentials.
@@ -396,6 +399,59 @@ impl Default for AgentConfig {
             nudge_after_secs: default_nudge_after_secs(),
         }
     }
+}
+
+/// The daemon-hosted browser (`[browser]`).
+///
+/// One real Chrome instance, driven by the daemon over CDP and shared by
+/// the agent and all its subagents through the `browser_*` tools on the
+/// chat MCP endpoint — so it works under every isolation mode and
+/// outlives per-turn agent respawns. Launch flags are minimal and
+/// automation-free (`--enable-automation` is never passed, and the CDP
+/// client never sends `Runtime.enable`), which is what makes the
+/// browser read as a human's to anti-bot walls.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BrowserConfig {
+    /// `false` runs the daemon with no browser tools (default `true`).
+    #[serde(default = "default_browser_enabled")]
+    pub enabled: bool,
+    /// Chrome-family executable. Default: auto-detect Google Chrome /
+    /// Chromium / Edge / Brave from the usual install paths.
+    pub executable: Option<PathBuf>,
+    /// Run headless (`--headless=new`, default `true`). Set `false` on a
+    /// machine with a logged-in desktop for the most human-looking
+    /// browser — a headed window is the strongest fingerprint signal.
+    #[serde(default = "default_browser_headless")]
+    pub headless: bool,
+    /// Browser profile directory (cookies, logins). Default
+    /// `<data_dir>/browser-profile`; persists across restarts.
+    pub profile_dir: Option<PathBuf>,
+    /// Extra Chrome command-line arguments appended after the built-in
+    /// minimal set (e.g. a `--proxy-server`, `--lang`, window size).
+    /// Automation flags like `--enable-automation` defeat the point —
+    /// don't add them.
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+impl Default for BrowserConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_browser_enabled(),
+            executable: None,
+            headless: default_browser_headless(),
+            profile_dir: None,
+            args: Vec::new(),
+        }
+    }
+}
+
+fn default_browser_enabled() -> bool {
+    true
+}
+
+fn default_browser_headless() -> bool {
+    true
 }
 
 /// Directories the daemon owns.

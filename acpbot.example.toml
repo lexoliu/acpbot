@@ -96,6 +96,17 @@ kind = "native"
 # Optional persona prepended to the shared agent's generated AGENTS.md.
 # persona = "You are a cheerful participant in this group."
 
+# [browser]
+# The daemon hosts one shared Chrome for the agent's browser_* tools,
+# driven over CDP with no automation flags — it reads as a human's
+# browser to anti-bot walls. Profile (cookies/logins) persists under
+# <data_dir>/browser-profile. Chrome launches lazily on first use.
+# enabled = true
+# executable = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"  # default: auto-detect Chrome/Chromium/Edge/Brave
+# headless = true   # false = a real window on the desktop — the most human-looking, needs a logged-in session
+# profile_dir = "~/.local/share/acpbot/browser-profile"
+# args = []         # extra Chrome flags, e.g. ["--proxy-server=..."] — never automation flags
+
 # [paths]
 # Root for the shared agent working dir, per-chat transcripts, the session
 # registry, and IPC sockets. Default: ~/.local/share/acpbot
