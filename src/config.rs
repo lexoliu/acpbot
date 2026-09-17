@@ -66,6 +66,16 @@ pub enum PlatformConfig {
 }
 
 impl PlatformConfig {
+    /// The platform tag events and `platform:id` chat keys carry —
+    /// the `kind` spelling.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Telegram { .. } => "telegram",
+            Self::Cli { .. } => "cli",
+            Self::Discord { .. } => "discord",
+        }
+    }
+
     /// Resolve the Telegram bot token from `token_env` or `token`.
     ///
     /// # Errors
