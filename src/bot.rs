@@ -3,7 +3,7 @@
 //!
 //! Handlers must return fast — Telegram's dispatcher processes updates one at
 //! a time — so they only build the event and push it into the channel; the
-//! per-chat actor performs the actual ACP turn.
+//! shared actor performs the actual ACP turn.
 
 use async_channel::Sender;
 use botkit_cli::{CliBot, CliContextData, Transport as CliTransport};

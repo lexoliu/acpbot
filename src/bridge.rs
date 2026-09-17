@@ -1,7 +1,7 @@
-//! `acpbot mcp-bridge <target>` — the link between an agent's stdio MCP
-//! transport and the daemon's per-chat MCP server.
+//! `acpbot mcp-bridge <target>` — the link between the agent's stdio MCP
+//! transport and the daemon's chat MCP server.
 //!
-//! The agent spawns this per session via `.devin/mcp_config.json`. The
+//! The agent spawns this via `.devin/mcp_config.json`. The
 //! target selects the transport:
 //!
 //! - `<path>` — a unix socket (isolation `none`): a byte-level pipe.
@@ -9,7 +9,7 @@
 //!   over the daemon's loopback listener.
 //! - `ipc:<command>` — inside a `heel` sandbox (isolation `native`): each
 //!   JSON-RPC line is relayed through the sandbox's IPC endpoint, which the
-//!   daemon's `chat-mcp` command forwards to the chat's unix socket.
+//!   daemon's `chat-mcp` command forwards to the agent's unix socket.
 //!
 //! It knows nothing about MCP beyond line framing: the daemon on the other
 //! end runs the real server, so a bridge can never outlive its purpose or

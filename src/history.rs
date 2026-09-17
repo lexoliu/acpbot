@@ -1,5 +1,6 @@
-//! The per-chat transcript log — `history.jsonl` inside the chat's working
-//! directory.
+//! The per-chat transcript log — `history.jsonl` inside the chat's own
+//! directory under `data_dir/chats/` (separate from the shared agent's
+//! working directory).
 //!
 //! Every inbound [`ChatEvent`] (daemon-internal `daemon`/`nudge` notes
 //! excluded) and every outbound action the agent takes is appended as one

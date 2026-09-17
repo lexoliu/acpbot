@@ -1,13 +1,13 @@
-//! How one chat's agent process is launched and isolated.
+//! How the shared agent process is launched and isolated.
 //!
 //! Three runtimes, selected by `[agent.isolation]`:
 //!
-//! - `native` (default): a [`heel`] sandbox per chat — strict filesystem and
+//! - `native` (default): a [`heel`] sandbox — strict filesystem and
 //!   credential protections, unrestricted network (`AllowAll` policy, so
 //!   traffic flows through heel's local proxy with nothing denied), and the
 //!   chat MCP tools carried over heel's own IPC channel: the sandboxed
 //!   `mcp-bridge` relays each JSON-RPC line through `chat-mcp`, which a
-//!   host-side relay task pumps into the chat's unix socket.
+//!   host-side relay task pumps into the agent's unix socket.
 //! - `docker`: `docker run` wraps the agent command; the chat directory and
 //!   the agent state directories are bind-mounted, and the bridge reaches
 //!   the daemon over `host.docker.internal` TCP.
@@ -37,14 +37,14 @@ use crate::mcpserver::ChatEndpoint;
 /// The IPC command the sandboxed `mcp-bridge` invokes for each JSON-RPC line.
 pub const CHAT_MCP_IPC: &str = "chat-mcp";
 
-/// The bridge target the chat's `mcp_config.json` should advertise.
+/// The bridge target the agent's `mcp_config.json` should advertise.
 #[derive(Debug, Clone)]
 pub enum BridgeTarget {
     /// `acpbot mcp-bridge <path>` — a unix socket on the host.
     #[cfg(unix)]
     Unix(PathBuf),
     /// `acpbot mcp-bridge tcp:host.docker.internal:<port>` — the daemon's
-    /// per-chat loopback listener, reached from inside the container.
+    /// exposed loopback listener, reached from inside the container.
     DockerTcp(u16),
     /// `acpbot mcp-bridge tcp:127.0.0.1:<port>` — the host-side endpoint on
     /// platforms without unix sockets (Windows `bare`/`native`).
@@ -85,7 +85,7 @@ impl BridgeTarget {
     }
 }
 
-/// Everything one chat needs to (re)spawn its agent process.
+/// Everything the actor needs to (re)spawn the agent process.
 pub enum AgentRuntime {
     /// A direct host spawn (`kind = "none"`).
     Bare,
@@ -104,7 +104,7 @@ pub struct NativeRuntime {
     program: String,
 }
 
-/// Precomputed `docker run` arguments for one chat.
+/// Precomputed `docker run` arguments for the agent.
 pub struct DockerRuntime {
     /// Everything between `docker run` and the agent command: mounts, env,
     /// the caller's extra args, and the image tag (which must come last
@@ -125,9 +125,9 @@ pub struct SpawnedAgent {
 }
 
 impl AgentRuntime {
-    /// Build the runtime for one chat. For `native` this creates the sandbox
-    /// (working directory, proxy, IPC server); for `docker` it assembles the
-    /// `docker run` argument list.
+    /// Build the runtime for the shared agent. For `native` this creates
+    /// the sandbox (working directory, proxy, IPC server); for `docker` it
+    /// assembles the `docker run` argument list.
     pub async fn create(
         isolation: &AgentIsolation,
         agent: &AgentConfig,
@@ -444,7 +444,7 @@ type SocketConn = (
     Pin<Box<dyn futures_lite::AsyncWrite + Send>>,
 );
 
-/// Connect one stream to the chat's MCP endpoint.
+/// Connect one stream to the chat MCP endpoint.
 async fn connect_endpoint(endpoint: &ChatEndpoint) -> std::io::Result<SocketConn> {
     match endpoint {
         #[cfg(unix)]
@@ -461,7 +461,7 @@ async fn connect_endpoint(endpoint: &ChatEndpoint) -> std::io::Result<SocketConn
     }
 }
 
-/// Spawn the relay task that owns this chat's MCP socket connection for
+/// Spawn the relay task that owns the agent's MCP socket connection for
 /// IPC-bridged calls.
 fn spawn_relay(endpoint: ChatEndpoint) -> ChanSender<RelayRequest> {
     let (tx, rx) = async_channel::unbounded::<RelayRequest>();

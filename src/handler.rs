@@ -17,7 +17,7 @@ use aither_mcp::protocol::JsonRpcError;
 use futures_lite::io::AsyncWriteExt;
 use tracing::{debug, warn};
 
-/// Handles agent-to-client traffic for one chat session.
+/// Handles agent-to-client traffic for the shared session.
 #[derive(Debug)]
 pub struct BotClientHandler {
     /// File the session's updates are appended to, one JSON line each.

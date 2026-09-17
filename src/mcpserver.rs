@@ -1,11 +1,11 @@
 //! The daemon side of the chat-tools MCP server.
 //!
-//! Each chat owns an endpoint the agent's `mcp-bridge` connects to: a unix
+//! The shared agent owns one endpoint its `mcp-bridge` connects to: a unix
 //! socket for host-side runtimes (`none`, and `native` via the IPC relay),
 //! or a loopback TCP listener for `docker` (reached from the container as
 //! `host.docker.internal`). Every accepted connection is served by an
-//! `aither_mcp::McpServer` whose tools are bound to that chat, so a tool
-//! call can never cross conversations.
+//! `aither_mcp::McpServer` whose tools resolve their target chat per call
+//! through the shared [`ChatRouter`](crate::agent::ChatRouter).
 
 use std::path::PathBuf;
 
@@ -17,7 +17,7 @@ use tracing::{info, warn};
 
 use crate::error::McpServerError;
 
-/// The endpoint a chat's MCP server is reachable at.
+/// The endpoint the chat MCP server is reachable at.
 ///
 /// Unix platforms use a socket path for host-side runtimes; Windows has no
 /// unix sockets, so every runtime there shares the loopback-TCP shape docker
@@ -90,7 +90,7 @@ async fn spawn_tcp_listener_on(
     Ok(addr)
 }
 
-/// Bind a chat's MCP endpoint for host-side runtimes: a unix socket on unix,
+/// Bind the chat MCP endpoint for host-side runtimes: a unix socket on unix,
 /// a loopback TCP port on Windows. Returns the endpoint the bridge and the
 /// native relay use to reach it.
 #[cfg(unix)]
@@ -102,7 +102,7 @@ pub async fn bind_host_endpoint(
     Ok(ChatEndpoint::Unix(socket))
 }
 
-/// Bind a chat's MCP endpoint for host-side runtimes: a unix socket on unix,
+/// Bind the chat MCP endpoint for host-side runtimes: a unix socket on unix,
 /// a loopback TCP port on Windows. Returns the endpoint the bridge and the
 /// native relay use to reach it.
 #[cfg(windows)]

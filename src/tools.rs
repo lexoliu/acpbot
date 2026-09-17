@@ -1,9 +1,11 @@
 //! MCP tools the agent uses to speak in the chat — and to evolve itself.
 //!
-//! One [`Tools`] registry is built per accepted bridge connection, bound to
-//! that chat's [`Sender`], sticker directory, and restart channel. The
-//! daemon serves it through `aither_mcp::McpServer`; the agent sees it as
-//! MCP server `chat`.
+//! One [`Tools`] registry is built per accepted bridge connection. The
+//! single agent session serves every chat, so chat-bound tools resolve
+//! their target through the shared [`ChatRouter`]: an optional `chat`
+//! argument picks a conversation, and its absence means the chat whose
+//! events triggered the in-flight turn. The daemon serves it through
+//! `aither_mcp::McpServer`; the agent sees it as MCP server `chat`.
 
 use std::path::PathBuf;
 
@@ -13,41 +15,38 @@ use botkit_telegram::{InlineKeyboardButton, InlineKeyboardMarkup, MediaKind};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
+use crate::agent::ChatRouter;
 use crate::history::History;
 use crate::sender::Sender;
 use crate::stickerlib::{LibrarySticker, StickerLibrary};
 use crate::stickers::StickerPack;
 use std::sync::Arc;
 
-/// Build the chat toolset bound to one conversation.
+/// Build the chat toolset, backed by the shared chat router.
 ///
-/// `sticker_dir` is re-scanned on every sticker call so a file the agent
-/// just dropped into the pack is immediately sendable; `restart` receives
-/// a unit when the agent asks to be reincarnated.
-pub fn chat_tools(
-    sender: Sender,
-    sticker_dir: PathBuf,
-    library: Arc<StickerLibrary>,
-    restart: ChanSender<()>,
-    history: Arc<History>,
-) -> Tools {
+/// `router`'s sticker directory is re-scanned on every sticker call so a
+/// file the agent just dropped into the pack is immediately sendable;
+/// `restart` receives a unit when the agent asks to be reincarnated.
+pub fn chat_tools(router: Arc<ChatRouter>, restart: ChanSender<()>) -> Tools {
+    let sticker_dir = router.shared().sticker_dir.clone();
+    let library = router.shared().sticker_library.clone();
     let mut tools = Tools::new();
     register(
         &mut tools,
         SendMessage {
-            sender: sender.clone(),
+            router: router.clone(),
         },
     );
     register(
         &mut tools,
         Reply {
-            sender: sender.clone(),
+            router: router.clone(),
         },
     );
     register(
         &mut tools,
         SendSticker {
-            sender: sender.clone(),
+            router: router.clone(),
             sticker_dir: sticker_dir.clone(),
             library: library.clone(),
         },
@@ -55,37 +54,37 @@ pub fn chat_tools(
     register(
         &mut tools,
         SendFile {
-            sender: sender.clone(),
+            router: router.clone(),
         },
     );
     register(
         &mut tools,
         React {
-            sender: sender.clone(),
+            router: router.clone(),
         },
     );
     register(
         &mut tools,
         EditMessage {
-            sender: sender.clone(),
+            router: router.clone(),
         },
     );
     register(
         &mut tools,
         DeleteMessage {
-            sender: sender.clone(),
+            router: router.clone(),
         },
     );
     register(
         &mut tools,
         PinMessage {
-            sender: sender.clone(),
+            router: router.clone(),
         },
     );
     register(
         &mut tools,
         MessageStatus {
-            sender: sender.clone(),
+            router: router.clone(),
         },
     );
     register(
@@ -111,11 +110,10 @@ pub fn chat_tools(
     register(
         &mut tools,
         ChatHistory {
-            history: history.clone(),
-            sender: sender.clone(),
+            router: router.clone(),
         },
     );
-    register(&mut tools, SearchHistory { history, sender });
+    register(&mut tools, SearchHistory { router });
     register(&mut tools, Restart { restart });
     tools
 }
@@ -126,6 +124,12 @@ fn register(tools: &mut Tools, tool: impl Tool + 'static) {
         .expect("chat tool registration is static and cannot fail");
 }
 
+/// Resolve a call's `chat` argument to its [`Sender`]. Failures are usage
+/// errors surfaced as tool results, not protocol errors.
+fn target(router: &ChatRouter, chat: Option<&str>) -> Result<Sender, ToolResult> {
+    router.sender_for(chat).map_err(ToolResult::error)
+}
+
 /// The pack is re-read from disk so agents can extend it mid-session.
 fn load_pack(dir: &std::path::Path) -> aither_core::Result<StickerPack> {
     StickerPack::load(dir)
@@ -134,7 +138,7 @@ fn load_pack(dir: &std::path::Path) -> aither_core::Result<StickerPack> {
 
 /// Send a new text message to the chat.
 struct SendMessage {
-    sender: Sender,
+    router: Arc<ChatRouter>,
 }
 
 /// Arguments for `send_message`.
@@ -145,6 +149,9 @@ struct SendMessageArgs {
     /// Optional inline keyboard: rows of buttons, each `{text, data}`
     /// (a press arrives as a `button` event) or `{text, url}` (a link).
     buttons: Option<Vec<Vec<ButtonArg>>>,
+    /// Target chat — the `chat` id from an event, or `platform:id`.
+    /// Omit for the chat the current events came from.
+    chat: Option<String>,
 }
 
 /// One inline-keyboard button: a callback (`data`) or a link (`url`).
@@ -211,14 +218,18 @@ impl Tool for SendMessage {
             Ok(markup) => markup,
             Err(msg) => return Ok(ToolResult::error(msg)),
         };
-        let id = self.sender.send(&args.text, markup).await?;
+        let sender = match target(&self.router, args.chat.as_deref()) {
+            Ok(sender) => sender,
+            Err(result) => return Ok(result),
+        };
+        let id = sender.send(&args.text, markup).await?;
         Ok(ToolResult::text(format!("sent message {id}")))
     }
 }
 
 /// Reply to a specific message.
 struct Reply {
-    sender: Sender,
+    router: Arc<ChatRouter>,
 }
 
 /// Arguments for `reply`.
@@ -230,6 +241,9 @@ struct ReplyArgs {
     text: String,
     /// Optional inline keyboard — same shape as `send_message`'s `buttons`.
     buttons: Option<Vec<Vec<ButtonArg>>>,
+    /// Target chat — the `chat` id from an event, or `platform:id`.
+    /// Omit for the chat the current events came from.
+    chat: Option<String>,
 }
 
 impl Tool for Reply {
@@ -252,17 +266,18 @@ impl Tool for Reply {
             Ok(markup) => markup,
             Err(msg) => return Ok(ToolResult::error(msg)),
         };
-        let id = self
-            .sender
-            .reply(args.message_id, &args.text, markup)
-            .await?;
+        let sender = match target(&self.router, args.chat.as_deref()) {
+            Ok(sender) => sender,
+            Err(result) => return Ok(result),
+        };
+        let id = sender.reply(args.message_id, &args.text, markup).await?;
         Ok(ToolResult::text(format!("sent reply {id}")))
     }
 }
 
 /// Send a sticker — from the pack by name, or by Telegram `file_id`.
 struct SendSticker {
-    sender: Sender,
+    router: Arc<ChatRouter>,
     sticker_dir: PathBuf,
     library: Arc<StickerLibrary>,
 }
@@ -274,6 +289,9 @@ struct SendStickerArgs {
     name: Option<String>,
     /// A Telegram `file_id` — e.g. to resend a sticker an event carried.
     file_id: Option<String>,
+    /// Target chat — the `chat` id from an event, or `platform:id`.
+    /// Omit for the chat the current events came from.
+    chat: Option<String>,
 }
 
 impl Tool for SendSticker {
@@ -294,8 +312,12 @@ impl Tool for SendSticker {
     }
 
     async fn call(&self, args: Self::Arguments) -> aither_core::Result<Self::Res> {
+        let sender = match target(&self.router, args.chat.as_deref()) {
+            Ok(sender) => sender,
+            Err(result) => return Ok(result),
+        };
         if let Some(file_id) = args.file_id {
-            let id = self.sender.send_sticker_id(&file_id).await?;
+            let id = sender.send_sticker_id(&file_id).await?;
             return Ok(ToolResult::text(format!("sent sticker as message {id}")));
         }
         let Some(name) = args.name else {
@@ -303,14 +325,14 @@ impl Tool for SendSticker {
         };
         let pack = load_pack(&self.sticker_dir)?;
         if let Some(sticker) = pack.get(&name) {
-            let id = self.sender.send_sticker(sticker).await?;
+            let id = sender.send_sticker(sticker).await?;
             return Ok(ToolResult::text(format!(
                 "sent sticker {} as message {id}",
                 sticker.name
             )));
         }
         if let Some(file_id) = self.library.file_id(&name).await {
-            let id = self.sender.send_sticker_id(&file_id).await?;
+            let id = sender.send_sticker_id(&file_id).await?;
             return Ok(ToolResult::text(format!(
                 "sent sticker {name} as message {id}"
             )));
@@ -323,7 +345,7 @@ impl Tool for SendSticker {
 
 /// Send an arbitrary file as media — photo, video, audio, voice, or document.
 struct SendFile {
-    sender: Sender,
+    router: Arc<ChatRouter>,
 }
 
 /// Arguments for `send_file`.
@@ -338,6 +360,9 @@ struct SendFileArgs {
     kind: Option<String>,
     /// Optional caption (ignored for stickers).
     caption: Option<String>,
+    /// Target chat — the `chat` id from an event, or `platform:id`.
+    /// Omit for the chat the current events came from.
+    chat: Option<String>,
 }
 
 impl Tool for SendFile {
@@ -358,16 +383,19 @@ impl Tool for SendFile {
 
     async fn call(&self, args: Self::Arguments) -> aither_core::Result<Self::Res> {
         let caption = args.caption.as_deref();
+        let sender = match target(&self.router, args.chat.as_deref()) {
+            Ok(sender) => sender,
+            Err(result) => return Ok(result),
+        };
         if let Some(file_id) = args.file_id {
             let kind = parse_kind(args.kind.as_deref())?;
-            let id = self.sender.send_file_id(kind, &file_id, caption).await?;
+            let id = sender.send_file_id(kind, &file_id, caption).await?;
             return Ok(ToolResult::text(format!("sent media as message {id}")));
         }
         let Some(path) = args.path else {
             return Ok(ToolResult::error("give `path` or `file_id`"));
         };
-        let id = self
-            .sender
+        let id = sender
             .send_file(std::path::Path::new(&path), caption)
             .await?;
         Ok(ToolResult::text(format!("sent {path} as message {id}")))
@@ -376,7 +404,7 @@ impl Tool for SendFile {
 
 /// React to a message with an emoji (or clear the bot's reaction).
 struct React {
-    sender: Sender,
+    router: Arc<ChatRouter>,
 }
 
 /// Arguments for `react`.
@@ -388,6 +416,9 @@ struct ReactArgs {
     emoji: Option<String>,
     /// Play the big animation. Default false.
     is_big: Option<bool>,
+    /// Target chat — the `chat` id from an event, or `platform:id`.
+    /// Omit for the chat the current events came from.
+    chat: Option<String>,
 }
 
 impl Tool for React {
@@ -405,7 +436,11 @@ impl Tool for React {
     }
 
     async fn call(&self, args: Self::Arguments) -> aither_core::Result<Self::Res> {
-        self.sender
+        let sender = match target(&self.router, args.chat.as_deref()) {
+            Ok(sender) => sender,
+            Err(result) => return Ok(result),
+        };
+        sender
             .react(
                 args.message_id,
                 args.emoji.as_deref(),
@@ -421,7 +456,7 @@ impl Tool for React {
 
 /// Edit the text of a message the bot sent.
 struct EditMessage {
-    sender: Sender,
+    router: Arc<ChatRouter>,
 }
 
 /// Arguments for `edit_message`.
@@ -431,6 +466,9 @@ struct EditMessageArgs {
     message_id: i64,
     /// The replacement text.
     text: String,
+    /// Target chat — the `chat` id from an event, or `platform:id`.
+    /// Omit for the chat the current events came from.
+    chat: Option<String>,
 }
 
 impl Tool for EditMessage {
@@ -448,7 +486,11 @@ impl Tool for EditMessage {
     }
 
     async fn call(&self, args: Self::Arguments) -> aither_core::Result<Self::Res> {
-        self.sender.edit(args.message_id, &args.text).await?;
+        let sender = match target(&self.router, args.chat.as_deref()) {
+            Ok(sender) => sender,
+            Err(result) => return Ok(result),
+        };
+        sender.edit(args.message_id, &args.text).await?;
         Ok(ToolResult::text(format!(
             "edited message {}",
             args.message_id
@@ -458,7 +500,7 @@ impl Tool for EditMessage {
 
 /// Delete a message.
 struct DeleteMessage {
-    sender: Sender,
+    router: Arc<ChatRouter>,
 }
 
 /// Arguments for `delete_message`.
@@ -466,6 +508,9 @@ struct DeleteMessage {
 struct DeleteMessageArgs {
     /// The message to delete (the bot's own, or any where it can).
     message_id: i64,
+    /// Target chat — the `chat` id from an event, or `platform:id`.
+    /// Omit for the chat the current events came from.
+    chat: Option<String>,
 }
 
 impl Tool for DeleteMessage {
@@ -483,7 +528,11 @@ impl Tool for DeleteMessage {
     }
 
     async fn call(&self, args: Self::Arguments) -> aither_core::Result<Self::Res> {
-        self.sender.delete_message(args.message_id).await?;
+        let sender = match target(&self.router, args.chat.as_deref()) {
+            Ok(sender) => sender,
+            Err(result) => return Ok(result),
+        };
+        sender.delete_message(args.message_id).await?;
         Ok(ToolResult::text(format!(
             "deleted message {}",
             args.message_id
@@ -493,7 +542,7 @@ impl Tool for DeleteMessage {
 
 /// Pin or unpin a message.
 struct PinMessage {
-    sender: Sender,
+    router: Arc<ChatRouter>,
 }
 
 /// Arguments for `pin_message`.
@@ -505,6 +554,9 @@ struct PinMessageArgs {
     unpin: Option<bool>,
     /// Notify the chat about the pin. Default true.
     notify: Option<bool>,
+    /// Target chat — the `chat` id from an event, or `platform:id`.
+    /// Omit for the chat the current events came from.
+    chat: Option<String>,
 }
 
 impl Tool for PinMessage {
@@ -522,7 +574,11 @@ impl Tool for PinMessage {
     }
 
     async fn call(&self, args: Self::Arguments) -> aither_core::Result<Self::Res> {
-        self.sender
+        let sender = match target(&self.router, args.chat.as_deref()) {
+            Ok(sender) => sender,
+            Err(result) => return Ok(result),
+        };
+        sender
             .pin(
                 args.message_id,
                 args.unpin.unwrap_or(false),
@@ -749,7 +805,7 @@ impl Tool for ListStickerSets {
     }
 }
 
-/// Ask the daemon to reincarnate this chat's agent process.
+/// Ask the daemon to reincarnate the shared agent process.
 struct Restart {
     restart: ChanSender<()>,
 }
@@ -836,7 +892,7 @@ fn render_records(records: Vec<serde_json::Value>) -> ToolResult {
 /// to learn a message was deleted, since Telegram reports no deletion
 /// event to bots.
 struct MessageStatus {
-    sender: Sender,
+    router: Arc<ChatRouter>,
 }
 
 /// Arguments for `message_status`.
@@ -844,6 +900,9 @@ struct MessageStatus {
 struct MessageStatusArgs {
     /// The message id to check — from an event or a history record.
     message_id: i64,
+    /// Target chat — the `chat` id from an event, or `platform:id`.
+    /// Omit for the chat the current events came from.
+    chat: Option<String>,
 }
 
 impl Tool for MessageStatus {
@@ -862,7 +921,11 @@ impl Tool for MessageStatus {
     }
 
     async fn call(&self, args: Self::Arguments) -> aither_core::Result<Self::Res> {
-        let exists = self.sender.probe_message(args.message_id).await?;
+        let sender = match target(&self.router, args.chat.as_deref()) {
+            Ok(sender) => sender,
+            Err(result) => return Ok(result),
+        };
+        let exists = sender.probe_message(args.message_id).await?;
         Ok(ToolResult::text(
             serde_json::json!({"message_id": args.message_id, "exists": exists}).to_string(),
         ))
@@ -898,11 +961,10 @@ async fn annotate_deleted(records: &mut [serde_json::Value], sender: &Sender, hi
     }
 }
 
-/// Read back the chat transcript: every inbound event and outbound action,
+/// Read back a chat's transcript: every inbound event and outbound action,
 /// newest `limit` inside the range.
 struct ChatHistory {
-    history: Arc<History>,
-    sender: Sender,
+    router: Arc<ChatRouter>,
 }
 
 /// Arguments for `history`.
@@ -910,6 +972,9 @@ struct ChatHistory {
 struct HistoryArgs {
     #[serde(flatten)]
     range: TimeRangeArgs,
+    /// Whose transcript — the `chat` id from an event, or `platform:id`.
+    /// Omit for the chat the current events came from.
+    chat: Option<String>,
 }
 
 impl Tool for ChatHistory {
@@ -921,11 +986,13 @@ impl Tool for ChatHistory {
     }
 
     fn description(&self) -> std::borrow::Cow<'static, str> {
-        "Pull the chat transcript: every inbound event and everything you sent, \
-         as JSON records with `ts`/`time`, `dir` (in/out), `from`, `text`. \
+        "Pull a chat's transcript: every inbound event and everything you sent \
+         there, as JSON records with `ts`/`time`, `dir` (in/out), `from`, `text`. \
          `since`/`until` accept epoch seconds, RFC3339, or relative `30m`/`2h`/`7d`; \
-         `limit` (default 50) keeps the newest. Use it to recall what happened \
-         before your context window or to answer \"what did we say about X yesterday\"."
+         `limit` (default 50) keeps the newest. `chat` selects which chat's \
+         transcript — omit for the chat the current events came from. Use it to \
+         recall what happened before your context window or to answer \"what did \
+         we say about X yesterday\"."
             .into()
     }
 
@@ -934,16 +1001,19 @@ impl Tool for ChatHistory {
             Ok(bounds) => bounds,
             Err(msg) => return Ok(ToolResult::error(msg)),
         };
-        let mut records = self.history.tail(since, until, limit);
-        annotate_deleted(&mut records, &self.sender, &self.history).await;
+        let (history, sender) = match self.router.transcript_for(args.chat.as_deref()) {
+            Ok(target) => target,
+            Err(msg) => return Ok(ToolResult::error(msg)),
+        };
+        let mut records = history.tail(since, until, limit);
+        annotate_deleted(&mut records, &sender, &history).await;
         Ok(render_records(records))
     }
 }
 
-/// Search the chat transcript for text.
+/// Search a chat's transcript for text.
 struct SearchHistory {
-    history: Arc<History>,
-    sender: Sender,
+    router: Arc<ChatRouter>,
 }
 
 /// Arguments for `search_history`.
@@ -954,6 +1024,9 @@ struct SearchHistoryArgs {
     query: String,
     #[serde(flatten)]
     range: TimeRangeArgs,
+    /// Whose transcript — the `chat` id from an event, or `platform:id`.
+    /// Omit for the chat the current events came from.
+    chat: Option<String>,
 }
 
 impl Tool for SearchHistory {
@@ -965,10 +1038,11 @@ impl Tool for SearchHistory {
     }
 
     fn description(&self) -> std::borrow::Cow<'static, str> {
-        "Search the chat transcript — case-insensitive match on message text, \
+        "Search a chat's transcript — case-insensitive match on message text, \
          sender name, and command fields. Same `since`/`until`/`limit` as \
-         `history`. The fastest way to answer \"when did X mention Y\" or \
-         \"did I already reply to that\"."
+         `history`; `chat` selects which chat (default: the one the current \
+         events came from). The fastest way to answer \"when did X mention Y\" \
+         or \"did I already reply to that\"."
             .into()
     }
 
@@ -977,8 +1051,12 @@ impl Tool for SearchHistory {
             Ok(bounds) => bounds,
             Err(msg) => return Ok(ToolResult::error(msg)),
         };
-        let mut records = self.history.search(&args.query, since, until, limit);
-        annotate_deleted(&mut records, &self.sender, &self.history).await;
+        let (history, sender) = match self.router.transcript_for(args.chat.as_deref()) {
+            Ok(target) => target,
+            Err(msg) => return Ok(ToolResult::error(msg)),
+        };
+        let mut records = history.search(&args.query, since, until, limit);
+        annotate_deleted(&mut records, &sender, &history).await;
         Ok(render_records(records))
     }
 }
@@ -986,7 +1064,8 @@ impl Tool for SearchHistory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sender::Sender;
+    use crate::agent::tests::test_router;
+    use crate::chat::ChatKey;
     use async_channel::Receiver;
 
     fn tempdir(label: &str) -> PathBuf {
@@ -996,22 +1075,40 @@ mod tests {
         dir
     }
 
-    /// A toolset bound to a recording sender; the returned receivers must
-    /// outlive the calls or the channels close underneath them.
-    fn fixture(dir: &std::path::Path) -> (Tools, Receiver<String>, Receiver<()>, Arc<History>) {
+    fn test_key() -> ChatKey {
+        ChatKey {
+            platform: "telegram",
+            id: "0".to_string(),
+        }
+    }
+
+    /// The parts a test may care about: the toolset, the router behind it,
+    /// the senders' recorded calls, the chat keys senders were bound to,
+    /// the restart signal, and the test chat's transcript.
+    type Fixture = (
+        Tools,
+        Arc<ChatRouter>,
+        Receiver<String>,
+        Receiver<String>,
+        Receiver<()>,
+        Arc<History>,
+    );
+
+    /// A toolset served through a router whose senders record to `out`;
+    /// `keys` reports which chat each lazily-built sender was bound to.
+    /// The returned receivers must outlive the calls or the channels
+    /// close underneath them.
+    fn fixture(dir: &std::path::Path) -> Fixture {
         let (out_tx, out_rx) = async_channel::unbounded();
-        let (spoke_tx, _spoke_rx) = async_channel::unbounded();
         let (restart_tx, restart_rx) = async_channel::unbounded();
-        let history = Arc::new(History::open(dir.join("history.jsonl")));
+        let (router, keys) = test_router(dir, out_tx);
+        router.set_current(test_key());
+        let history = router.history(&test_key());
         (
-            chat_tools(
-                Sender::record(out_tx, spoke_tx).with_history(history.clone()),
-                dir.to_path_buf(),
-                Arc::new(crate::stickerlib::StickerLibrary::load(dir, None).unwrap()),
-                restart_tx,
-                history.clone(),
-            ),
+            chat_tools(router.clone(), restart_tx),
+            router,
             out_rx,
+            keys,
             restart_rx,
             history,
         )
@@ -1022,13 +1119,15 @@ mod tests {
     #[test]
     fn sticker_pack_hot_reloads() {
         let dir = tempdir("hot-reload");
-        let (tools, out, _restart, _history) = fixture(&dir);
+        let (tools, _router, out, _keys, _restart, _history) = fixture(&dir);
+        let pack_dir = dir.join("stickers");
+        std::fs::create_dir_all(&pack_dir).unwrap();
 
         let listed = futures_lite::future::block_on(tools.call("list_stickers", "{}")).unwrap();
         assert_eq!(listed.as_text(), Some("[]"));
 
-        std::fs::write(dir.join("smug.png"), b"png-bytes").unwrap();
-        std::fs::write(dir.join("stickers.toml"), "smug = \"a smug face\"\n").unwrap();
+        std::fs::write(pack_dir.join("smug.png"), b"png-bytes").unwrap();
+        std::fs::write(pack_dir.join("stickers.toml"), "smug = \"a smug face\"\n").unwrap();
 
         let listed = futures_lite::future::block_on(tools.call("list_stickers", "{}")).unwrap();
         let text = listed.as_text().unwrap();
@@ -1051,7 +1150,7 @@ mod tests {
     #[test]
     fn saved_sticker_sends_by_name() {
         let dir = tempdir("save-sticker");
-        let (tools, out, _restart, _history) = fixture(&dir);
+        let (tools, _router, out, _keys, _restart, _history) = fixture(&dir);
 
         let saved = futures_lite::future::block_on(tools.call(
             "save_sticker",
@@ -1088,7 +1187,7 @@ mod tests {
     #[test]
     fn registered_tool_names() {
         let dir = tempdir("tool-names");
-        let (tools, _out, _restart, _history) = fixture(&dir);
+        let (tools, _router, _out, _keys, _restart, _history) = fixture(&dir);
         let mut names: Vec<String> = tools
             .definitions()
             .iter()
@@ -1123,7 +1222,7 @@ mod tests {
     #[test]
     fn history_reads_back_outbound() {
         let dir = tempdir("history");
-        let (tools, _out, _restart, _history) = fixture(&dir);
+        let (tools, _router, _out, _keys, _restart, _history) = fixture(&dir);
         let block = |name, args| futures_lite::future::block_on(tools.call(name, args)).unwrap();
 
         block("send_message", "{\"text\":\"morning all\"}");
@@ -1153,7 +1252,7 @@ mod tests {
     #[test]
     fn message_status_and_deleted_annotation() {
         let dir = tempdir("status");
-        let (tools, _out, _restart, history) = fixture(&dir);
+        let (tools, _router, _out, _keys, _restart, history) = fixture(&dir);
         let block = |name, args| futures_lite::future::block_on(tools.call(name, args)).unwrap();
 
         // The Record platform reports every message alive.
@@ -1174,7 +1273,7 @@ mod tests {
     #[test]
     fn send_sticker_by_file_id() {
         let dir = tempdir("sticker-id");
-        let (tools, out, _restart, _history) = fixture(&dir);
+        let (tools, _router, out, _keys, _restart, _history) = fixture(&dir);
         let result = futures_lite::future::block_on(
             tools.call("send_sticker", "{\"file_id\":\"CAACAgEAAxk\"}"),
         )
@@ -1187,7 +1286,7 @@ mod tests {
     #[test]
     fn send_file_by_path_and_id() {
         let dir = tempdir("send-file");
-        let (tools, out, _restart, _history) = fixture(&dir);
+        let (tools, _router, out, _keys, _restart, _history) = fixture(&dir);
 
         let result = futures_lite::future::block_on(tools.call(
             "send_file",
@@ -1213,7 +1312,7 @@ mod tests {
     #[test]
     fn message_management_tools() {
         let dir = tempdir("manage");
-        let (tools, out, _restart, _history) = fixture(&dir);
+        let (tools, _router, out, _keys, _restart, _history) = fixture(&dir);
         let block = |args| futures_lite::future::block_on(tools.call("react", args)).unwrap();
 
         let result = block("{\"message_id\":9,\"emoji\":\"👍\"}");
@@ -1257,7 +1356,7 @@ mod tests {
     #[test]
     fn restart_signals_channel() {
         let dir = tempdir("restart");
-        let (tools, _out, restart_rx, _history) = fixture(&dir);
+        let (tools, _router, _out, _keys, restart_rx, _history) = fixture(&dir);
         let result = futures_lite::future::block_on(tools.call("restart", "{}")).unwrap();
         assert_eq!(
             result.as_text(),
@@ -1271,7 +1370,7 @@ mod tests {
     #[test]
     fn send_message_buttons_validate() {
         let dir = tempdir("buttons");
-        let (tools, out, _restart, _history) = fixture(&dir);
+        let (tools, _router, out, _keys, _restart, _history) = fixture(&dir);
 
         let result = futures_lite::future::block_on(tools.call(
             "send_message",
@@ -1296,5 +1395,50 @@ mod tests {
         ))
         .unwrap();
         assert!(result.is_error());
+    }
+
+    /// The `chat` argument picks the conversation a call lands in: absent
+    /// it is the turn's current chat, present it is that chat — and a bad
+    /// target is a usage error, not a send to the wrong room.
+    #[test]
+    fn chat_arg_routes() {
+        let dir = tempdir("route");
+        let (tools, router, out, keys, _restart, _history) = fixture(&dir);
+        let block = |name, args| futures_lite::future::block_on(tools.call(name, args)).unwrap();
+
+        // Default: the turn's current chat ("0") gets the sender.
+        let result = block("send_message", "{\"text\":\"home\"}");
+        assert!(!result.is_error());
+        assert_eq!(out.try_recv().unwrap(), "send:home");
+        assert_eq!(keys.try_recv().unwrap(), "0");
+
+        // Explicit `chat` builds and targets that chat's sender…
+        let result = block("send_message", "{\"text\":\"away\",\"chat\":\"7\"}");
+        assert!(!result.is_error());
+        assert_eq!(out.try_recv().unwrap(), "send:away");
+        assert_eq!(keys.try_recv().unwrap(), "7");
+
+        // …and a `platform:id` form resolves to the same cached sender.
+        let result = block(
+            "send_message",
+            "{\"text\":\"again\",\"chat\":\"telegram:7\"}",
+        );
+        assert!(!result.is_error());
+        assert_eq!(out.try_recv().unwrap(), "send:again");
+        assert!(keys.try_recv().is_err(), "sender rebuilt for cached chat");
+
+        // A chat the daemon doesn't serve can never be addressed.
+        let result = block("send_message", "{\"text\":\"x\",\"chat\":\"discord:9\"}");
+        assert!(result.is_error());
+
+        // `history` follows `chat` too: send into "7", read its transcript.
+        let text = block("history", "{\"chat\":\"7\"}")
+            .as_text()
+            .unwrap()
+            .to_string();
+        assert!(text.contains("away"), "{text}");
+        let text = block("history", "{}").as_text().unwrap().to_string();
+        assert!(!text.contains("away"), "{text}");
+        drop(router);
     }
 }

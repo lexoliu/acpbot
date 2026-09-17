@@ -1,8 +1,9 @@
 //! Platform-bound message sending for the agent's tools.
 //!
-//! A [`Sender`] is built per chat and cloned into every tool instance serving
-//! that chat's MCP connection. Tools therefore never carry platform
-//! identifiers — a call can only ever reach the conversation that spawned it.
+//! A [`Sender`] is built per chat, on demand, by the shared
+//! [`ChatRouter`](crate::agent::ChatRouter): a tool's `chat` argument (or
+//! the in-flight turn's triggering chat) resolves to the sender bound to
+//! that conversation.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -30,7 +31,7 @@ use crate::stickerset::StickerSet;
 
 /// Outbound operations bound to one chat.
 ///
-/// `spoke` is a per-chat signal shared by every `Sender` clone: the first
+/// `spoke` is the actor-global signal shared by every `Sender`: the first
 /// successful (or attempted) outbound action in a turn posts to it so the
 /// turn's typing indicator can stop immediately instead of running until
 /// the agent's turn ends.

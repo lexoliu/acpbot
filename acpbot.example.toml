@@ -83,12 +83,12 @@ kind = "native"
 # [agent.isolation]
 # kind = "none"
 
-# Optional persona prepended to every chat's generated AGENTS.md.
+# Optional persona prepended to the shared agent's generated AGENTS.md.
 # persona = "You are a cheerful participant in this group."
 
 # [paths]
-# Root for per-chat agent working dirs, the session registry, IPC sockets,
-# and transcripts. Default: ~/.local/share/acpbot
+# Root for the shared agent working dir, per-chat transcripts, the session
+# registry, and IPC sockets. Default: ~/.local/share/acpbot
 # data_dir = "~/.local/share/acpbot"
 # Sticker pack directory (file stem = sticker name). .webp/.png are
 # static stickers, .tgs animated, .webm video; a stickers.toml inside can

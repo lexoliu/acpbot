@@ -1,17 +1,18 @@
-//! Per-chat agent lifecycle.
+//! Shared agent lifecycle.
 //!
-//! Every chat gets its own `devin acp` child process and ACP session, driven
-//! by an actor that owns the chat's event queue. Per-process-per-chat keeps
-//! failure isolated and lets the session's working directory carry the
-//! chat-specific `.devin/mcp_config.json` — the channel through which the
-//! `chat` MCP tools reach the agent.
+//! One `devin acp` child process and ACP session serves every chat: a single
+//! actor owns the global event queue, so the model sees one context window
+//! across all conversations. The per-chat state that cannot be shared —
+//! platform [`Sender`]s, transcripts, forum-topic cells — lives in the
+//! [`ChatRouter`], which also tracks the chat whose events triggered the
+//! in-flight turn so tools default to answering it.
 
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::error::{AgentError, SenderError};
@@ -27,22 +28,24 @@ use tracing::{debug, error, info, warn};
 use crate::chat::{ChatEvent, ChatKey};
 use crate::config::{AgentConfig, AgentIsolation};
 use crate::handler::BotClientHandler;
+use crate::history::{History, history_path};
 use crate::mcpserver;
 use crate::sandbox::{AgentRuntime, BridgeTarget};
 use crate::sender::Sender;
 
 /// Builds a platform [`Sender`] bound to one chat. The channel carries the
-/// chat's "the agent spoke" signal shared by all senders of that chat; the
-/// `AtomicI64` is the forum-topic cell and the `AtomicU64` the last-action
-/// timestamp (epoch ms) every sender of the chat shares.
+/// global "the agent spoke" signal shared by all senders; the `AtomicI64`
+/// is the chat's forum-topic cell and the `AtomicU64` the last-action
+/// timestamp (epoch ms) every sender shares.
 pub type SenderFactory = Box<
     dyn Fn(&ChatKey, ChanSender<()>, Arc<AtomicI64>, Arc<AtomicU64>) -> Result<Sender, SenderError>
         + Send
         + Sync,
 >;
 
-/// What every chat actor shares: agent launch config, paths, the sticker
-/// pack directory, and a factory that binds a platform [`Sender`] to a chat.
+/// What the actor, router, and tools share: agent launch config, paths,
+/// the sticker pack directory, and a factory that binds a platform
+/// [`Sender`] to a chat.
 pub struct AgentShared {
     /// How to spawn and configure the agent process.
     pub agent: AgentConfig,
@@ -54,16 +57,16 @@ pub struct AgentShared {
     /// The sticker pack directory — re-scanned per tool call, and writable
     /// by the agent so it can extend its own pack.
     pub sticker_dir: PathBuf,
-    /// Persona text injected into every chat's `AGENTS.md`.
+    /// Persona text injected into the shared `AGENTS.md`.
     pub persona: Option<String>,
     /// Imported foreign sticker sets — bot-global, persisted under
     /// `data_dir`, shared by every chat's `send_sticker`.
     pub sticker_library: Arc<crate::stickerlib::StickerLibrary>,
     /// Builds a platform sender bound to a chat.
     pub sender_for: SenderFactory,
-    /// Where actors report `(chat, session_id)` once a session exists; the
-    /// dispatcher persists it for `session/load` on restart.
-    pub session_updates: ChanSender<(ChatKey, String)>,
+    /// Where the actor reports the session id once a session exists; the
+    /// dispatcher persists it so the shared session resumes on restart.
+    pub session_updates: ChanSender<String>,
 }
 
 /// Media above this many bytes stays an `inbox/` path in the event JSON
@@ -71,16 +74,195 @@ pub struct AgentShared {
 /// keeps a huge attachment from dominating the prompt.
 const MEDIA_INLINE_LIMIT: u64 = 8 * 1024 * 1024;
 
-/// Routes incoming events to per-chat actors, spawning one on first sight.
+/// The `sessions.json` key — and `chats/` subdirectory — of the one shared
+/// session. Per-chat slugs in a pre-shared `sessions.json` survive only so
+/// the first chat to speak after an upgrade can resume its old session as
+/// the shared one.
+const SHARED_SLUG: &str = "shared";
+
+/// The [`ChatKey`] an event belongs to.
+fn key_of(event: &ChatEvent) -> ChatKey {
+    ChatKey {
+        platform: event.platform,
+        id: event.chat.clone(),
+    }
+}
+
+/// The registry from [`ChatKey`] to the per-chat state the shared agent
+/// still needs: a chat's platform [`Sender`], its transcript [`History`],
+/// and its forum-topic cell — plus `current`, the chat whose events
+/// triggered the in-flight turn, which tools resolve to when their `chat`
+/// argument is omitted.
+///
+/// Senders and histories are built lazily on first sight of a chat. The
+/// mutex is held only for map operations, never across an `.await`.
+pub struct ChatRouter {
+    shared: Arc<AgentShared>,
+    state: Mutex<RouterState>,
+    /// Posted to by every sender on outbound output — capacity 1, so a
+    /// full channel is the "the agent already spoke this turn" flag.
+    spoke: ChanSender<()>,
+    /// Epoch ms of the agent's last outbound action anywhere — the nudge
+    /// watchdog measures user-visible silence against it.
+    last_action: Arc<AtomicU64>,
+    /// The platform the daemon serves — the tag a bare `chat` argument
+    /// resolves to (a daemon only ever bridges one platform).
+    platform: &'static str,
+}
+
+#[derive(Default)]
+struct RouterState {
+    /// One sender per chat, built on demand.
+    senders: HashMap<ChatKey, Sender>,
+    /// One transcript per chat.
+    histories: HashMap<ChatKey, Arc<History>>,
+    /// One forum-topic cell per chat — lives outside the senders so the
+    /// actor can set a topic before that chat's sender exists.
+    threads: HashMap<ChatKey, Arc<AtomicI64>>,
+    /// The chat whose events triggered the in-flight turn.
+    current: Option<ChatKey>,
+}
+
+impl RouterState {
+    /// The transcript of `key` (`<data>/chats/<slug>/history.jsonl`),
+    /// opened on first use.
+    fn history(&mut self, key: &ChatKey, data_dir: &Path) -> Arc<History> {
+        self.histories
+            .entry(key.clone())
+            .or_insert_with(|| {
+                Arc::new(History::open(history_path(
+                    &data_dir.join("chats").join(key.slug()),
+                )))
+            })
+            .clone()
+    }
+}
+
+impl ChatRouter {
+    fn new(
+        shared: Arc<AgentShared>,
+        spoke: ChanSender<()>,
+        last_action: Arc<AtomicU64>,
+        platform: &'static str,
+    ) -> Self {
+        Self {
+            shared,
+            state: Mutex::new(RouterState::default()),
+            spoke,
+            last_action,
+            platform,
+        }
+    }
+
+    /// The agent config, paths, and sticker stores the tools also need.
+    pub(crate) fn shared(&self) -> &AgentShared {
+        &self.shared
+    }
+
+    /// The chat the in-flight turn answers — the tools' default `chat`.
+    pub fn current(&self) -> Option<ChatKey> {
+        self.state.lock().expect("chat router").current.clone()
+    }
+
+    /// Point tool defaults at the chat whose events triggered the turn.
+    pub(crate) fn set_current(&self, key: ChatKey) {
+        self.state.lock().expect("chat router").current = Some(key);
+    }
+
+    /// Record the forum topic `key`'s current events arrived in (`0` =
+    /// none). The cell outlives any one sender, so this also reaches
+    /// senders built later.
+    pub(crate) fn set_thread(&self, key: &ChatKey, thread_id: i64) {
+        self.state
+            .lock()
+            .expect("chat router")
+            .threads
+            .entry(key.clone())
+            .or_default()
+            .store(thread_id, Ordering::Relaxed);
+    }
+
+    /// The transcript of `key`, opened on first use.
+    pub fn history(&self, key: &ChatKey) -> Arc<History> {
+        self.state
+            .lock()
+            .expect("chat router")
+            .history(key, &self.shared.data_dir)
+    }
+
+    /// The [`Sender`] bound to `key`, built through the platform factory
+    /// on first sight of the chat.
+    pub fn sender(&self, key: &ChatKey) -> Result<Sender, SenderError> {
+        let mut state = self.state.lock().expect("chat router");
+        if let Some(sender) = state.senders.get(key) {
+            return Ok(sender.clone());
+        }
+        let thread = state.threads.entry(key.clone()).or_default().clone();
+        let history = state.history(key, &self.shared.data_dir);
+        let sender =
+            (self.shared.sender_for)(key, self.spoke.clone(), thread, self.last_action.clone())?
+                .with_history(history);
+        state.senders.insert(key.clone(), sender.clone());
+        Ok(sender)
+    }
+
+    /// Resolve a tool's `chat` argument: `"platform:id"`, or a bare id on
+    /// the daemon's platform. `None` resolves to the in-flight turn's chat.
+    pub fn resolve(&self, chat: Option<&str>) -> Result<ChatKey, String> {
+        match chat {
+            Some(raw) => {
+                let (platform, id) = raw
+                    .split_once(':')
+                    .map_or((self.platform, raw.trim()), |(p, id)| (p.trim(), id.trim()));
+                if platform != self.platform {
+                    return Err(format!(
+                        "unknown platform {platform:?} — this bot serves {:?} only",
+                        self.platform
+                    ));
+                }
+                if id.is_empty() {
+                    return Err(format!("missing chat id in {raw:?}"));
+                }
+                Ok(ChatKey {
+                    platform: self.platform,
+                    id: id.to_string(),
+                })
+            }
+            None => self
+                .current()
+                .ok_or_else(|| "no active chat yet — pass `chat` explicitly".to_string()),
+        }
+    }
+
+    /// `resolve` + `sender` — a tool call's outbound target.
+    pub fn sender_for(&self, chat: Option<&str>) -> Result<Sender, String> {
+        let key = self.resolve(chat)?;
+        self.sender(&key).map_err(|e| e.to_string())
+    }
+
+    /// `resolve` + `history` + `sender` — the transcript tools' target.
+    /// The sender comes along so returned records can be probed for
+    /// deletion.
+    pub fn transcript_for(&self, chat: Option<&str>) -> Result<(Arc<History>, Sender), String> {
+        let key = self.resolve(chat)?;
+        let sender = self.sender(&key).map_err(|e| e.to_string())?;
+        Ok((self.history(&key), sender))
+    }
+}
+
+/// Forwards every chat's events to the one shared agent actor.
 pub struct Dispatcher {
     shared: Arc<AgentShared>,
-    actors: HashMap<ChatKey, (ChanSender<ChatEvent>, executor_core::AnyExecutorTask<()>)>,
-    /// chat key slug → ACP session id, loaded from `sessions.json`.
+    /// The shared actor's queue and task — spawned on the first event,
+    /// respawned if its run loop ever ends early.
+    actor: Option<(ChanSender<ChatEvent>, executor_core::AnyExecutorTask<()>)>,
+    /// `sessions.json` — slug → session id. The live session sits under
+    /// [`SHARED_SLUG`]; per-chat slugs remain only for the upgrade handoff.
     known_sessions: HashMap<String, String>,
-    /// Receives session ids reported by actors.
-    session_ids: Receiver<(ChatKey, String)>,
-    /// Cloned into every actor; dropping the sender ends their in-flight
-    /// turns so a daemon shutdown never leaves a sandboxed agent running.
+    /// Receives the session id the actor establishes.
+    session_ids: Receiver<String>,
+    /// Cloned into the actor; dropping the sender ends its in-flight turn
+    /// so a daemon shutdown never leaves a sandboxed agent running.
     shutdown: (Option<ChanSender<()>>, Receiver<()>),
 }
 
@@ -110,25 +292,32 @@ impl Dispatcher {
                 sender_for,
                 session_updates,
             }),
-            actors: HashMap::new(),
+            actor: None,
             known_sessions,
             session_ids,
             shutdown: (Some(shutdown_tx), shutdown_rx),
         }
     }
 
-    /// Consume events forever, routing each to its chat's actor.
+    /// Consume events forever, forwarding each to the shared actor.
     pub async fn run(mut self, events: Receiver<ChatEvent>) {
         loop {
-            let event = futures_lite::future::or(
+            // `race`, not `or`: `or` keeps waiting on the other arm after an
+            // `Err`, and `session_ids` never closes (its sender lives in
+            // `self.shared`) — so a closed event channel must complete on
+            // its own for shutdown to ever leave this loop.
+            let event = futures_lite::future::race(
                 async { events.recv().await.map(|e| Routed::Event(Box::new(e))) },
                 async { self.session_ids.recv().await.map(Routed::SessionId) },
             )
             .await;
             match event {
-                Ok(Routed::Event(event)) => self.dispatch(event).await,
-                Ok(Routed::SessionId((key, sid))) => {
-                    self.known_sessions.insert(key.slug(), sid);
+                Ok(Routed::Event(event)) => self.dispatch(*event).await,
+                Ok(Routed::SessionId(sid)) => {
+                    // The shared session supersedes every per-chat id —
+                    // once it exists the legacy slugs are dead weight.
+                    self.known_sessions.clear();
+                    self.known_sessions.insert(SHARED_SLUG.to_string(), sid);
                     save_sessions(&self.shared.data_dir, &self.known_sessions);
                 }
                 Err(_) => break,
@@ -136,29 +325,41 @@ impl Dispatcher {
         }
 
         // The event channel closed: the daemon is shutting down. Closing the
-        // shutdown channel interrupts in-flight turns; dropping each actor's
+        // shutdown channel interrupts an in-flight turn; dropping the actor's
         // sender ends its run loop; awaiting its task lets the actor drop its
         // runtime — a heel Sandbox kills the agent process on the way out.
         drop(self.shutdown.0.take());
-        for (tx, task) in self.actors.drain().map(|(_, entry)| entry) {
+        if let Some((tx, task)) = self.actor.take() {
             drop(tx);
             task.await;
         }
+        // The actor can report its session id right up to its task's end —
+        // drain what arrived so the next run resumes it.
+        while let Ok(sid) = self.session_ids.try_recv() {
+            self.known_sessions.clear();
+            self.known_sessions.insert(SHARED_SLUG.to_string(), sid);
+            save_sessions(&self.shared.data_dir, &self.known_sessions);
+        }
     }
 
-    async fn dispatch(&mut self, event: Box<ChatEvent>) {
-        let event = *event;
-        let key = ChatKey {
-            platform: event.platform,
-            id: event.chat.clone(),
-        };
-        if let Some((tx, _)) = self.actors.get(&key)
+    async fn dispatch(&mut self, event: ChatEvent) {
+        if let Some((tx, _)) = &self.actor
             && tx.send(event.clone()).await.is_ok()
         {
             return;
         }
 
-        // No actor yet (or it died): spawn one.
+        // No actor yet (or it died): spawn the shared one. The session it
+        // resumes is `shared` from a previous run — or, on upgrade from the
+        // per-chat layout, the triggering chat's own session, so that
+        // conversation's context becomes the shared context.
+        let key = key_of(&event);
+        let session_id = self
+            .known_sessions
+            .get(SHARED_SLUG)
+            .or_else(|| self.known_sessions.get(&key.slug()))
+            .cloned();
+
         let (tx, rx) = async_channel::unbounded();
         // Capacity 1: a full channel is the "the agent already spoke
         // this turn" flag, and the drain at turn start resets it.
@@ -166,20 +367,20 @@ impl Dispatcher {
         let last_action = Arc::new(AtomicU64::new(crate::sender::epoch_ms()));
         let (restart_tx, restart_rx) = async_channel::unbounded();
         let actor = ChatActor {
-            key: key.clone(),
             shared: self.shared.clone(),
-            history: Arc::new(crate::history::History::open(crate::history::history_path(
-                &self.shared.data_dir.join("chats").join(key.slug()),
-            ))),
+            router: Arc::new(ChatRouter::new(
+                self.shared.clone(),
+                spoke_tx,
+                last_action.clone(),
+                key.platform,
+            )),
             client: None,
-            session_id: self.known_sessions.get(&key.slug()).cloned(),
+            session_id,
             mcp_endpoint: None,
             runtime: None,
             child: None,
-            thread: Arc::new(AtomicI64::new(0)),
             prompt_caps: PromptCapabilities::default(),
             compact_supported: Arc::new(AtomicBool::new(false)),
-            spoke_tx,
             spoke_rx,
             last_action,
             restart_tx,
@@ -187,16 +388,16 @@ impl Dispatcher {
             shutdown_rx: self.shutdown.1.clone(),
         };
         let task = executor_core::spawn(actor.run(rx));
-        self.actors.insert(key.clone(), (tx.clone(), task));
+        self.actor = Some((tx.clone(), task));
         if tx.send(event).await.is_err() {
-            error!(%key, "fresh chat actor refused first event");
+            error!("shared agent actor refused its first event");
         }
     }
 }
 
 enum Routed {
     Event(Box<ChatEvent>),
-    SessionId((ChatKey, String)),
+    SessionId(String),
 }
 
 /// What [`wait_event`] resolved to.
@@ -235,31 +436,24 @@ impl Drop for TurnTyping {
     }
 }
 
-/// One chat's agent process, session, and event queue.
+/// The one agent process, ACP session, and event queue every chat shares.
 struct ChatActor {
-    key: ChatKey,
     shared: Arc<AgentShared>,
-    /// The chat's transcript log — inbound events land here from `run`,
-    /// outbound actions from the `Sender`, and the `history`/
-    /// `search_history` tools read it back.
-    history: Arc<crate::history::History>,
+    /// Per-chat senders, transcripts, and topic cells — plus `current`,
+    /// the chat whose events triggered the in-flight turn. Shared with
+    /// every tool the chat MCP endpoint serves.
+    router: Arc<ChatRouter>,
     client: Option<AcpClient<BotClientHandler>>,
     session_id: Option<String>,
     /// The bound MCP endpoint — socket path on unix, loopback TCP where
     /// unix sockets don't exist, docker's gateway TCP for `docker`.
     mcp_endpoint: Option<crate::mcpserver::ChatEndpoint>,
-    /// The chat's isolation runtime (sandbox/container), once created.
+    /// The agent's isolation runtime (sandbox/container), once created.
     runtime: Option<AgentRuntime>,
     /// The sandboxed child handle of the current agent process, if any.
     child: Option<heel::Child>,
-    /// Forum topic the in-flight turn's events arrived in (`0` = none);
-    /// every `Sender` built for this chat reads it so sends land in the
-    /// topic the user addressed.
-    thread: Arc<AtomicI64>,
-    /// Shared with every `Sender` of this chat: receives a unit each time the
-    /// agent produces outbound output.
-    spoke_tx: ChanSender<()>,
-    /// Drained per turn to stop the typing indicator on the first send.
+    /// Drained per turn to stop the typing indicator on the first send;
+    /// every sender posts to its sender half.
     spoke_rx: Receiver<()>,
     /// Epoch ms of the agent's last outbound action — every sender writes
     /// it through `spoke`; the nudge watchdog reads it to measure silence.
@@ -283,9 +477,9 @@ struct ChatActor {
 }
 
 impl ChatActor {
-    /// The chat's working directory (`<data_dir>/chats/<slug>/`).
+    /// The shared agent working directory (`<data_dir>/chats/shared/`).
     fn cwd(&self) -> PathBuf {
-        self.shared.data_dir.join("chats").join(self.key.slug())
+        self.shared.data_dir.join("chats").join(SHARED_SLUG)
     }
 
     /// The IPC socket the MCP bridge connects to.
@@ -293,11 +487,11 @@ impl ChatActor {
         self.shared
             .data_dir
             .join("run")
-            .join(self.key.slug() + ".sock")
+            .join(format!("{SHARED_SLUG}.sock"))
     }
 
-    /// The `command`/`args` `mcp_config.json` should spawn to reach this
-    /// chat's MCP endpoint — the host `acpbot` binary for `none`/`native`,
+    /// The `command`/`args` `mcp_config.json` should spawn to reach the
+    /// chat MCP endpoint — the host `acpbot` binary for `none`/`native`,
     /// the configured in-container command for `docker`.
     fn mcp_server_entry(&self) -> Result<(String, Vec<String>), AgentError> {
         let endpoint = self.mcp_endpoint.as_ref().expect("bound first");
@@ -318,9 +512,14 @@ impl ChatActor {
         }
     }
 
-    /// The transcript file inside the chat cwd.
+    /// The transcript file inside the shared cwd.
     fn transcript_path(&self) -> PathBuf {
         self.cwd().join("transcript.log")
+    }
+
+    /// The transcript of the chat `event` belongs to.
+    fn log_event(&self, event: &ChatEvent) {
+        self.router.history(&key_of(event)).append_event(event);
     }
 
     async fn run(mut self, rx: Receiver<ChatEvent>) {
@@ -346,24 +545,26 @@ impl ChatActor {
                         Waited::Closed => return,
                         Waited::Idle => {
                             if let Err(error) = self.compact().await {
-                                warn!(chat = %self.key, %error, "idle compaction failed");
+                                warn!(%error, "idle compaction failed");
                             }
                             idle_compacted = true;
                             continue;
                         }
                     }
                 };
-                self.history.append_event(&first);
+                self.log_event(&first);
                 batch.push(first);
             }
             idle_compacted = false;
-            // Coalesce events that arrived while a turn was in flight.
+            // Coalesce events that arrived while a turn was in flight —
+            // a batch can mix chats, and each event lands in its own
+            // chat's transcript.
             while let Ok(event) = rx.try_recv() {
-                self.history.append_event(&event);
+                self.log_event(&event);
                 batch.push(event);
             }
             if let Err(error) = self.turn(&batch, &rx, &mut pending).await {
-                error!(chat = %self.key, %error, "turn failed");
+                error!(%error, "turn failed");
             }
         }
     }
@@ -383,10 +584,10 @@ impl ChatActor {
             return Ok(());
         };
         if !self.compact_supported.load(Ordering::Relaxed) {
-            debug!(chat = %self.key, "idle; agent has no compact command, skipping");
+            debug!("idle; agent has no compact command, skipping");
             return Ok(());
         }
-        info!(chat = %self.key, "idle; compacting session");
+        info!("idle; compacting session");
         let result = client
             .prompt(PromptParams::new(
                 session_id.clone(),
@@ -397,11 +598,15 @@ impl ChatActor {
                 })],
             ))
             .await?;
-        debug!(chat = %self.key, stop = ?result.stop_reason, "idle compaction done");
+        debug!(stop = ?result.stop_reason, "idle compaction done");
         Ok(())
     }
 
     /// Deliver one batch of events to the agent as a single prompt.
+    ///
+    /// A batch can mix chats when events coalesced mid-turn; the freshest
+    /// event's chat becomes the turn's `current` — the default target for
+    /// the agent's tool calls.
     ///
     /// `rx` stays wired into the prompt wait so a `stop` event can cancel
     /// the turn mid-flight; non-stop events pulled that way land in
@@ -413,34 +618,35 @@ impl ChatActor {
         pending: &mut Vec<ChatEvent>,
     ) -> Result<(), AgentError> {
         let turn_started = Instant::now();
-        self.thread.store(
-            batch
-                .iter()
-                .filter_map(|event| event.thread_id)
-                .next_back()
-                .unwrap_or(0),
-            Ordering::Relaxed,
-        );
-        self.ensure_ready().await?;
+        let current = key_of(batch.last().expect("a batch is never empty"));
+        self.router.set_current(current.clone());
 
-        let sender = (self.shared.sender_for)(
-            &self.key,
-            self.spoke_tx.clone(),
-            self.thread.clone(),
-            self.last_action.clone(),
-        )?;
+        // Forum topics stay per chat: each chat present in the batch gets
+        // the last `thread_id` its events carried (`0` clears).
+        let mut threads: HashMap<ChatKey, i64> = HashMap::new();
+        for event in batch {
+            threads.insert(key_of(event), event.thread_id.unwrap_or(0));
+        }
+        for (key, thread_id) in threads {
+            self.router.set_thread(&key, thread_id);
+        }
+
+        self.ensure_ready().await?;
 
         // Pull every file the events carry into `inbox/` so the agent can
         // open the bytes; image payloads also go into the prompt as `image`
-        // content blocks so vision-capable models see them directly.
-        let chat_dir = self.cwd();
+        // content blocks so vision-capable models see them directly. The
+        // download goes through the origin chat's sender (platform APIs
+        // are chat-bound) into the shared working directory.
+        let agent_dir = self.cwd();
         let mut batch = batch.to_vec();
         for event in &mut batch {
+            let sender = self.router.sender(&key_of(event))?;
             if let Some(media) = &mut event.media {
-                media.file = sender.fetch_media(&media.file_id, &chat_dir).await?;
+                media.file = sender.fetch_media(&media.file_id, &agent_dir).await?;
             }
             if let Some(sticker) = &mut event.sticker {
-                sticker.file = sender.fetch_media(&sticker.file_id, &chat_dir).await?;
+                sticker.file = sender.fetch_media(&sticker.file_id, &agent_dir).await?;
             }
         }
 
@@ -460,7 +666,7 @@ impl ChatActor {
             if !is_image && !is_audio {
                 continue;
             }
-            let bytes = async_fs::read(chat_dir.join(&file.path)).await?;
+            let bytes = async_fs::read(agent_dir.join(&file.path)).await?;
             if bytes.len() as u64 > MEDIA_INLINE_LIMIT {
                 continue;
             }
@@ -484,7 +690,7 @@ impl ChatActor {
             });
         }
 
-        let _typing = self.start_turn_typing(sender, turn_started);
+        let _typing = self.start_turn_typing(current, turn_started);
         self.last_action
             .store(crate::sender::epoch_ms(), Ordering::Relaxed);
 
@@ -516,7 +722,7 @@ impl ChatActor {
             // A dead child fails every pending request with `Closed`: respawn
             // once, reload the session, and retry the prompt once.
             Err(ClientError::Closed { .. }) => {
-                warn!(chat = %self.key, "agent process died; respawning");
+                warn!("agent process died; respawning");
                 self.client = None;
                 if let Some(mut child) = self.child.take() {
                     let _ = child.kill();
@@ -548,7 +754,7 @@ impl ChatActor {
             restart = true;
         }
         if restart {
-            info!(chat = %self.key, "agent requested restart");
+            info!("agent requested restart");
             self.client = None;
             if let Some(mut child) = self.child.take() {
                 let _ = child.kill();
@@ -625,10 +831,17 @@ impl ChatActor {
                 Race::Shutdown => return Ok(PromptEnd::Shutdown),
                 Race::EventsClosed => events_open = false,
                 Race::Event(event) => {
-                    self.history.append_event(&event);
-                    if event.is_stop() {
-                        info!(chat = %self.key, "user said stop; cancelling turn");
-                        cancel_and_settle(client, session_id, &mut prompt, &self.key).await;
+                    self.log_event(&event);
+                    // A `stop` only cancels the turn it belongs to: a stop
+                    // from another chat is that chat's next-turn business,
+                    // not a veto over this one's work.
+                    let owns_turn = self
+                        .router
+                        .current()
+                        .is_some_and(|current| current == key_of(&event));
+                    if event.is_stop() && owns_turn {
+                        info!(chat = %key_of(&event), "user said stop; cancelling turn");
+                        cancel_and_settle(client, session_id, &mut prompt).await;
                         return Ok(PromptEnd::Stopped);
                     }
                     pending.push(*event);
@@ -640,10 +853,10 @@ impl ChatActor {
                         continue;
                     }
                     warn!(
-                        chat = %self.key,
+                        chat = ?self.router.current(),
                         silent_ms, "agent silent past the nudge deadline; interrupting"
                     );
-                    cancel_and_settle(client, session_id, &mut prompt, &self.key).await;
+                    cancel_and_settle(client, session_id, &mut prompt).await;
                     // The nudged turn gets a fresh silence budget — it must
                     // still speak within `nudge_after` or be interrupted
                     // again.
@@ -652,7 +865,7 @@ impl ChatActor {
                     prompt = Box::pin(client.prompt(PromptParams::new(
                         session_id,
                         vec![ContentBlock::Text(TextContent {
-                            text: nudge_event_text(),
+                            text: nudge_event_text(self.router.current().as_ref()),
                             annotations: None,
                             meta: None,
                         })],
@@ -710,7 +923,6 @@ impl ChatActor {
         let init = client.initialize().await?;
         self.prompt_caps = init.agent_capabilities.prompt_capabilities.clone();
         info!(
-            chat = %self.key,
             agent = init.agent_info.as_ref().map_or("?", |i| i.name.as_str()),
             image = self.prompt_caps.image,
             audio = self.prompt_caps.audio,
@@ -737,7 +949,7 @@ impl ChatActor {
             ))
             .await
         {
-            warn!(chat = %self.key, %error, "set_mode failed");
+            warn!(%error, "set_mode failed");
         }
         if let Err(error) = client
             .set_config_option(SessionSetConfigOptionParams::new(
@@ -747,42 +959,23 @@ impl ChatActor {
             ))
             .await
         {
-            warn!(chat = %self.key, %error, "set_config_option(model) failed");
+            warn!(%error, "set_config_option(model) failed");
         }
 
         self.session_id = Some(session_id.clone());
         self.client = Some(client);
-        let _ = self
-            .shared
-            .session_updates
-            .try_send((self.key.clone(), session_id));
+        let _ = self.shared.session_updates.try_send(session_id);
         Ok(())
     }
 
-    /// Bind this chat's MCP endpoint — a unix socket on unix, loopback TCP
+    /// Bind the shared MCP endpoint — a unix socket on unix, loopback TCP
     /// on Windows, docker's gateway listener for `docker` — and return it.
+    /// Every accepted connection gets tools backed by the same router.
     async fn bind_mcp_endpoint(&mut self) -> Result<crate::mcpserver::ChatEndpoint, AgentError> {
         let make_tools = {
-            let sender = (self.shared.sender_for)(
-                &self.key,
-                self.spoke_tx.clone(),
-                self.thread.clone(),
-                self.last_action.clone(),
-            )?
-            .with_history(self.history.clone());
-            let sticker_dir = self.shared.sticker_dir.clone();
-            let sticker_library = self.shared.sticker_library.clone();
+            let router = self.router.clone();
             let restart = self.restart_tx.clone();
-            let history = self.history.clone();
-            move || {
-                crate::tools::chat_tools(
-                    sender.clone(),
-                    sticker_dir.clone(),
-                    sticker_library.clone(),
-                    restart.clone(),
-                    history.clone(),
-                )
-            }
+            move || crate::tools::chat_tools(router.clone(), restart.clone())
         };
         match &self.shared.agent.isolation {
             AgentIsolation::Docker(_) => Ok(mcpserver::bind_docker_endpoint(make_tools).await?),
@@ -797,8 +990,9 @@ impl ChatActor {
         }
     }
 
-    /// Show "typing…" until the agent's first outbound send this turn, the
-    /// turn ends (guard dropped), or the channel dies — whichever is first.
+    /// Show "typing…" in `key`'s chat until the agent's first outbound send
+    /// this turn, the turn ends (guard dropped), or the channel dies —
+    /// whichever is first.
     ///
     /// The inner `ChatActionGuard` lives inside a spawned task so it can be
     /// dropped mid-turn from outside: without this, typing keeps renewing
@@ -808,14 +1002,21 @@ impl ChatActor {
     /// happens within [`ACK_TIMEOUT`] of the turn starting it logs the
     /// miss (the agent owns the ack — nobody speaks for it) while the
     /// typing indicator keeps the wait visible.
-    fn start_turn_typing(&self, sender: Sender, turn_started: Instant) -> TurnTyping {
+    fn start_turn_typing(&self, key: ChatKey, turn_started: Instant) -> TurnTyping {
         // Stale signals from the previous turn must not kill this turn's
         // indicator the instant it starts.
         while self.spoke_rx.try_recv().is_ok() {}
 
+        let sender = match self.router.sender(&key) {
+            Ok(sender) => sender,
+            Err(error) => {
+                warn!(chat = %key, %error, "typing indicator unavailable");
+                return TurnTyping(async_channel::bounded::<()>(1).0);
+            }
+        };
         let (done_tx, done_rx) = async_channel::bounded::<()>(1);
         executor_core::spawn(typing_task(
-            self.key.clone(),
+            key,
             sender,
             self.spoke_rx.clone(),
             done_rx,
@@ -843,20 +1044,20 @@ impl ChatActor {
                 .await
             {
                 Ok(_) => {
-                    info!(chat = %self.key, session = sid, "resumed session");
+                    info!(session = sid, "resumed session");
                     return Some(sid.to_string());
                 }
-                Err(error) => warn!(chat = %self.key, session = sid, %error,
+                Err(error) => warn!(session = sid, %error,
                                     "session/resume failed"),
             }
         }
         if caps.load_session {
             match client.load_session(SessionLoadParams::new(sid, cwd)).await {
                 Ok(_) => {
-                    info!(chat = %self.key, session = sid, "loaded session");
+                    info!(session = sid, "loaded session");
                     return Some(sid.to_string());
                 }
-                Err(error) => warn!(chat = %self.key, session = sid, %error,
+                Err(error) => warn!(session = sid, %error,
                                     "session/load failed"),
             }
         }
@@ -869,7 +1070,7 @@ impl ChatActor {
         cwd: &Path,
     ) -> Result<String, AgentError> {
         let result = client.new_session(SessionNewParams::new(cwd)).await?;
-        info!(chat = %self.key, session = %result.session_id, "session created");
+        info!(session = %result.session_id, "session created");
         Ok(result.session_id)
     }
 }
@@ -968,10 +1169,9 @@ async fn cancel_and_settle(
     client: &AcpClient<BotClientHandler>,
     session_id: &str,
     prompt: &mut Pin<Box<dyn Future<Output = Result<PromptResult, ClientError>> + Send + '_>>,
-    key: &ChatKey,
 ) {
     if let Err(error) = client.cancel(session_id).await {
-        debug!(chat = %key, %error, "cancel failed — turn may have ended");
+        debug!(%error, "cancel failed — turn may have ended");
     }
     futures_lite::future::or(
         async {
@@ -985,21 +1185,28 @@ async fn cancel_and_settle(
 }
 
 /// The `nudge` event text injected after a silence interrupt — a `system`
-/// event in the same envelope the agent already parses.
-fn nudge_event_text() -> String {
-    serde_json::json!({
+/// event in the same envelope the agent already parses, carrying the chat
+/// the interrupted turn was answering so the update lands in the right room.
+fn nudge_event_text(chat: Option<&ChatKey>) -> String {
+    let mut event = serde_json::json!({
         "type": "nudge",
         "ts": crate::sender::epoch_secs(),
-        "note": "You have been silent too long — the user is waiting.                  Send a short update now, then continue the task you were                  doing.",
-    })
-    .to_string()
+        "note": "You have been silent too long — the user is waiting. \
+                 Send a short update now, then continue the task you were \
+                 doing.",
+    });
+    if let Some(chat) = chat {
+        event["platform"] = serde_json::json!(chat.platform);
+        event["chat"] = serde_json::json!(chat.id);
+    }
+    event.to_string()
 }
 
-/// Write the per-chat `AGENTS.md` and `.devin/mcp_config.json`.
+/// Write the shared `AGENTS.md` and `.devin/mcp_config.json`.
 ///
 /// The MCP config is what connects the agent to the daemon: devin loads
 /// project-scope MCP servers from the session's cwd, and `acpbot mcp-bridge`
-/// pipes them to this chat's MCP endpoint — a unix socket, a loopback TCP
+/// pipes them to the shared MCP endpoint — a unix socket, a loopback TCP
 /// port, or the sandbox's IPC relay, depending on isolation mode.
 fn prepare_chat_dir(
     cwd: &Path,
@@ -1118,30 +1325,30 @@ ONLY way to communicate is to call a tool on the MCP server named `chat` \
 (the tools appear as `mcp__chat__*`; `mcp_list_tools` with `server_name` = \
 `chat` shows their schemas):
 
-- `send_message` `{text, buttons?}` — post a new message. Every call \
+- `send_message` `{text, buttons?, chat?}` — post a new message. Every call \
 arrives as one complete, separately-visible message: compose the full \
 text first and never use a stream of calls to deliver one thought. \
 `buttons` is an array of rows of buttons, each `{text, data}` (a press \
 arrives as a `button` event carrying `data`) or `{text, url}` (a link).
-- `reply` `{message_id, text, buttons?}` — quote-reply to a specific \
+- `reply` `{message_id, text, buttons?, chat?}` — quote-reply to a specific \
 message; same keyboard shape.
-- `send_file` `{path}` or `{file_id, kind}` — send media: images go as \
-photos (gif as animation), videos as video, audio as audio (ogg as a voice \
-note), anything else as a document. `caption` is optional.
-- `send_sticker` `{name}` or `{file_id}` — send a native sticker. Pack \
-names publish into the bot's own Telegram sticker set on first send; a \
-`file_id` resends a sticker an event carried.
-- `react` `{message_id, emoji?, is_big?}` — set your emoji reaction on a \
-message (`👍`, `❤`, `🔥`, `😁`, `👎`, `🤔`, …); omit `emoji` to remove it, \
-`is_big` plays the large animation. A reaction is often the better ack — \
-cheaper than a whole message.
-- `edit_message` `{message_id, text}` — rewrite a message you sent, e.g. \
-grow a progress note into the final result.
-- `delete_message` `{message_id}` — delete a message (yours anywhere, \
-others' where the bot has delete rights).
-- `pin_message` `{message_id, unpin?, notify?}` — pin to the top of the \
-chat (`unpin` removes the pin; `notify: false` pins silently).
-- `message_status` `{message_id}` — whether a message still exists. \
+- `send_file` `{path}` or `{file_id, kind}`, plus `caption?`/`chat?` — \
+send media: images go as photos (gif as animation), videos as video, \
+audio as audio (ogg as a voice note), anything else as a document.
+- `send_sticker` `{name}` or `{file_id}`, plus `chat?` — send a native \
+sticker. Pack names publish into the bot's own Telegram sticker set on \
+first send; a `file_id` resends a sticker an event carried.
+- `react` `{message_id, emoji?, is_big?, chat?}` — set your emoji reaction \
+on a message (`👍`, `❤`, `🔥`, `😁`, `👎`, `🤔`, …); omit `emoji` to \
+remove it, `is_big` plays the large animation. A reaction is often the \
+better ack — cheaper than a whole message.
+- `edit_message` `{message_id, text, chat?}` — rewrite a message you sent, \
+e.g. grow a progress note into the final result.
+- `delete_message` `{message_id, chat?}` — delete a message (yours \
+anywhere, others' where the bot has delete rights).
+- `pin_message` `{message_id, unpin?, notify?, chat?}` — pin to the top of \
+the chat (`unpin` removes the pin; `notify: false` pins silently).
+- `message_status` `{message_id, chat?}` — whether a message still exists. \
 Deletions are never pushed to you: if you need to know a message (yours \
 or a user's) is still there, ask. `history`/`search_history` also mark \
 records `\"deleted\": true` once known.
@@ -1156,16 +1363,28 @@ or when they send a sticker from it. \
 - `save_sticker` `{file_id, name, emoji?, set_name?}` — keep one sticker an \
 event carried under a name you choose, without importing its set. \
 - `list_sticker_sets` `{}` — which sets the library holds. \
-- `history` `{since?, until?, limit?}` — the chat transcript: every inbound \
-event and everything you sent, `ts`/`time`, `dir`, `from`, `text`. Times \
-take epoch seconds, RFC3339, or relative `30m`/`2h`/`7d`; `limit` (default \
-50) keeps the newest. \
-- `search_history` `{query, since?, until?, limit?}` — the transcript \
-grepped: case-insensitive match on text, sender name, and command fields. \
-Use these to recall what happened before your context window — \"what did \
-we say about X yesterday\" is a `search_history` call, not a guess. \
+- `history` `{since?, until?, limit?, chat?}` — a chat's transcript: every \
+inbound event and everything you sent there, `ts`/`time`, `dir`, `from`, \
+`text`. Times take epoch seconds, RFC3339, or relative `30m`/`2h`/`7d`; \
+`limit` (default 50) keeps the newest. \
+- `search_history` `{query, since?, until?, limit?, chat?}` — a chat's \
+transcript grepped: case-insensitive match on text, sender name, and \
+command fields. Use these to recall what happened before your context \
+window — \"what did we say about X yesterday\" is a `search_history` call, \
+not a guess. \
 - `restart` `{}` — reincarnate your process after editing AGENTS.md or \
 adding skills; the session persists.
+
+**One session, every chat.** All of the bot's conversations share this one \
+agent: events from every chat arrive here, and `platform` + `chat` on each \
+event say where it happened — what a user tells you in DM you also know in \
+the group, and vice versa. Every tool marked `chat?` above takes an \
+optional `chat` argument: the `chat` id from an event, or `platform:id`. \
+Omit it and the tool acts on the chat the current events came from — pass \
+it to reach another conversation: carry a group answer into a DM, check a \
+group's `history` while answering a private question, or post into a chat \
+nobody pinged you in. Cross-chat sends are real sends — do them when the \
+user asked for it or the context makes it obviously right, not on a whim.
 
 **Acknowledge first, work second.** Your FIRST action on every event batch \
 must be a `chat` tool call — a short ack like \\\"on it\\\" or \\\"looking\\\", \
@@ -1274,7 +1493,7 @@ fn save_sessions(data_dir: &Path, sessions: &HashMap<String, String>) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::config::DockerIsolation;
     use std::time::{Duration, Instant};
@@ -1383,7 +1602,7 @@ mod tests {
 
         let transcript = data_dir
             .join("chats")
-            .join("telegram-0")
+            .join(SHARED_SLUG)
             .join("transcript.log");
         let dump = || std::fs::read_to_string(&transcript).unwrap_or_default();
 
@@ -1458,6 +1677,94 @@ mod tests {
             platform: "telegram",
             id: "0".to_string(),
         }
+    }
+
+    /// A router whose senders record to `out` — every factory call reports
+    /// the key it was built for on `keys`.
+    pub(crate) fn test_router(
+        dir: &Path,
+        out: ChanSender<String>,
+    ) -> (Arc<ChatRouter>, Receiver<String>) {
+        let (keys_tx, keys) = async_channel::unbounded();
+        let (spoke_tx, _spoke_rx) = async_channel::bounded(1);
+        let shared = Arc::new(AgentShared {
+            agent: AgentConfig::default(),
+            bridge_bin: PathBuf::from("/nonexistent/acpbot"),
+            data_dir: dir.to_path_buf(),
+            sticker_dir: dir.join("stickers"),
+            persona: None,
+            sticker_library: Arc::new(crate::stickerlib::StickerLibrary::load(dir, None).unwrap()),
+            sender_for: Box::new(move |key, spoke, _, _| {
+                let _ = keys_tx.try_send(key.id.clone());
+                Ok(Sender::record(out.clone(), spoke))
+            }),
+            session_updates: async_channel::unbounded().0,
+        });
+        (
+            Arc::new(ChatRouter::new(
+                shared,
+                spoke_tx,
+                Arc::new(AtomicU64::new(0)),
+                "telegram",
+            )),
+            keys,
+        )
+    }
+
+    /// `resolve`: bare ids take the daemon's platform, `platform:id` is
+    /// explicit, `None` is the turn's chat.
+    #[test]
+    fn resolve_forms() {
+        let dir = std::env::temp_dir().join(format!("acpbot-resolve-{}", std::process::id()));
+        let (out, _out_rx) = async_channel::unbounded();
+        let (router, _keys) = test_router(&dir, out);
+
+        // No current yet and no argument: nothing to answer.
+        assert!(router.resolve(None).is_err());
+
+        let key = router.resolve(Some("123")).unwrap();
+        assert_eq!(key.id, "123");
+        assert_eq!(key.platform, "telegram");
+
+        let key = router.resolve(Some("telegram:456")).unwrap();
+        assert_eq!(key.id, "456");
+
+        // A foreign platform can never be routed.
+        assert!(router.resolve(Some("discord:9")).is_err());
+        assert!(router.resolve(Some("telegram:")).is_err());
+
+        router.set_current(test_key());
+        assert_eq!(router.resolve(None).unwrap(), test_key());
+    }
+
+    /// A chat's sender is built once, tagged with its key, and reused —
+    /// sends after `set_current` or with an explicit `chat` resolve to the
+    /// right conversation.
+    #[test]
+    fn senders_are_per_chat() {
+        let dir = std::env::temp_dir().join(format!("acpbot-senders-{}", std::process::id()));
+        let (out, _out_rx) = async_channel::unbounded();
+        let (router, keys) = test_router(&dir, out);
+        router.set_current(test_key());
+
+        let a = router.sender_for(None).unwrap();
+        let b = router.sender_for(Some("7")).unwrap();
+        assert_eq!(keys.try_recv().unwrap(), "0");
+        assert_eq!(keys.try_recv().unwrap(), "7");
+        // Second resolution reuses the cached sender — no rebuild.
+        let b2 = router.sender_for(Some("telegram:7")).unwrap();
+        assert!(keys.try_recv().is_err());
+        drop((a, b, b2));
+
+        // Histories are per chat too.
+        router
+            .history(&test_key())
+            .append_event(&serde_json::json!({"ts":1}));
+        router.history(&ChatKey {
+            platform: "telegram",
+            id: "7".to_string(),
+        });
+        assert_eq!(router.history(&test_key()).tail(None, None, 10).len(), 1);
     }
 
     /// A silent agent gets no cover: past the deadline nothing is sent —
