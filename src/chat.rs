@@ -166,6 +166,10 @@ pub struct ChatEvent {
     /// or `channel` — when the platform reports it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chat_type: Option<&'static str>,
+    /// The chat's title, when the platform reports it (Telegram groups and
+    /// channels carry one; DMs, Discord messages, and the CLI do not).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chat_title: Option<String>,
     /// Message id, when the event carries one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message_id: Option<i64>,
@@ -268,6 +272,7 @@ mod tests {
             ts: 1700000000,
             attention: "direct",
             chat_type: Some("private"),
+            chat_title: None,
             message_id: Some(9),
             from: EventSender {
                 id: "7".to_string(),
@@ -347,6 +352,7 @@ mod tests {
             ts: 1700000000,
             attention: "ambient",
             chat_type: Some("supergroup"),
+            chat_title: None,
             message_id: Some(9),
             from: EventSender {
                 id: "7".to_string(),

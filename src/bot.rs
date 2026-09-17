@@ -186,6 +186,7 @@ fn to_event(ctx: &Context, me: &Identity) -> ChatEvent {
         ts: crate::sender::epoch_secs(),
         attention: "direct",
         chat_type: None,
+        chat_title: None,
         message_id: None,
         from: EventSender {
             id: ctx.user_id().to_string(),
@@ -462,6 +463,7 @@ fn extract_telegram(
         args: ctx.command_args().map(str::to_string),
     });
     event.chat_type = chat_kind(&data.update);
+    event.chat_title = update_chat(&data.update).and_then(|chat| chat.title.clone());
     event.attention = attention(&data.update, me);
 
     match &data.update.kind {
@@ -610,15 +612,19 @@ fn extract_generic(ctx: &Context, mut event: ChatEvent) -> ChatEvent {
     event
 }
 
+/// The chat an update arrived in, whichever update kind it is.
+fn update_chat(update: &Update) -> Option<&botkit_telegram::types::Chat> {
+    match &update.kind {
+        UpdateKind::Message(m) | UpdateKind::EditedMessage(m) => Some(&m.chat),
+        UpdateKind::CallbackQuery(cq) => cq.message.as_ref().map(|m| &m.chat),
+        UpdateKind::MessageReaction(r) => Some(&r.chat),
+        UpdateKind::Unknown => None,
+    }
+}
+
 /// The platform-reported chat shape, when the update carries a chat.
 fn chat_kind(update: &Update) -> Option<&'static str> {
-    let chat = match &update.kind {
-        UpdateKind::Message(m) | UpdateKind::EditedMessage(m) => &m.chat,
-        UpdateKind::CallbackQuery(cq) => &cq.message.as_ref()?.chat,
-        UpdateKind::MessageReaction(r) => &r.chat,
-        UpdateKind::Unknown => return None,
-    };
-    Some(match chat.chat_type {
+    update_chat(update).map(|chat| match chat.chat_type {
         ChatType::Private => "private",
         ChatType::Group => "group",
         ChatType::Supergroup => "supergroup",

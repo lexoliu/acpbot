@@ -109,6 +109,12 @@ pub fn chat_tools(router: Arc<ChatRouter>, restart: ChanSender<()>) -> Tools {
     register(&mut tools, ListStickerSets { library });
     register(
         &mut tools,
+        ListChats {
+            router: router.clone(),
+        },
+    );
+    register(
+        &mut tools,
         ChatInfo {
             router: router.clone(),
         },
@@ -1018,6 +1024,70 @@ impl Tool for ChatInfo {
     }
 }
 
+/// List every chat the bot has state for.
+struct ListChats {
+    router: Arc<ChatRouter>,
+}
+
+/// Arguments for `list_chats` (none).
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ListChatsArgs {}
+
+impl Tool for ListChats {
+    type Arguments = ListChatsArgs;
+    type Res = ToolResult;
+
+    fn name(&self) -> std::borrow::Cow<'static, str> {
+        "list_chats".into()
+    }
+
+    fn description(&self) -> std::borrow::Cow<'static, str> {
+        "Every chat the bot has touched — each `chat` value here is a valid \
+         `chat` argument for the other tools. No platform lets a bot \
+         enumerate its chats, so this registry is built by observation: \
+         entries appear when an event arrives or a send/probe targets the \
+         chat. Each record carries `type` and `title` when seen, \
+         `first_seen`/`last_seen` activity times, and the forum `topics` \
+         observed there. Pair with `chat_info` for live metadata."
+            .into()
+    }
+
+    async fn call(&self, _args: Self::Arguments) -> aither_core::Result<Self::Res> {
+        let iso = |ts: i64| {
+            jiff::Timestamp::from_second(ts)
+                .map(|t| t.to_string())
+                .unwrap_or_default()
+        };
+        let entries: Vec<serde_json::Value> = self
+            .router
+            .chats()
+            .into_iter()
+            .map(|(chat, record)| {
+                let mut entry = serde_json::json!({
+                    "chat": chat,
+                    "type": record.chat_type,
+                    "title": record.title,
+                    "first_seen": record.first_seen,
+                    "first_seen_time": iso(record.first_seen),
+                    "last_seen": record.last_seen,
+                    "last_seen_time": iso(record.last_seen),
+                });
+                if !record.topics.is_empty() {
+                    entry["topics"] = record
+                        .topics
+                        .into_iter()
+                        .map(|(thread, ts)| (thread.to_string(), serde_json::Value::from(iso(ts))))
+                        .collect();
+                }
+                entry
+            })
+            .collect();
+        Ok(ToolResult::text(
+            serde_json::to_string(&entries).expect("chat list serializes"),
+        ))
+    }
+}
+
 /// Read one message out of a chat by id or link.
 struct FetchMessage {
     router: Arc<ChatRouter>,
@@ -1311,6 +1381,7 @@ mod tests {
                 "fetch_message",
                 "history",
                 "import_sticker_set",
+                "list_chats",
                 "list_sticker_sets",
                 "list_stickers",
                 "message_status",
@@ -1355,6 +1426,30 @@ mod tests {
         // A bad time argument is a usage error, not a panic.
         let result = block("history", "{\"since\":\"yesterdayish\"}");
         assert!(result.is_error());
+    }
+
+    /// `list_chats` answers from the durable registry: the fixture's chat
+    /// (registered when its IM record opened) plus a send to a chat no
+    /// event ever came from.
+    #[test]
+    fn list_chats_enumerates_known_chats() {
+        let dir = tempdir("list-chats");
+        let (tools, _router, out, _keys, _restart, _history) = fixture(&dir);
+        let block = |name, args| futures_lite::future::block_on(tools.call(name, args)).unwrap();
+
+        block("send_message", "{\"chat\":\"123\",\"text\":\"hi\"}");
+        let _ = out.try_recv();
+
+        let text = block("list_chats", "{}").as_text().unwrap().to_string();
+        let entries: serde_json::Value = serde_json::from_str(&text).expect("chat list is JSON");
+        let chats: Vec<&str> = entries
+            .as_array()
+            .expect("chat list is an array")
+            .iter()
+            .filter_map(|e| e["chat"].as_str())
+            .collect();
+        assert!(chats.contains(&"telegram:0"), "{text}");
+        assert!(chats.contains(&"telegram:123"), "{text}");
     }
 
     /// `message_status` probes existence; `history` marks records whose

@@ -16,6 +16,7 @@ mod error;
 mod handler;
 mod history;
 mod mcpserver;
+mod registry;
 mod sandbox;
 mod sender;
 mod stickerlib;
