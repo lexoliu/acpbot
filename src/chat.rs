@@ -96,18 +96,19 @@ pub struct EventSticker {
     pub set_name: Option<String>,
     /// `animated` (.tgs), `video` (.webm), or `static`.
     pub format: &'static str,
-    /// Local copy of the file inside the chat dir (`inbox/…`), when the
-    /// download succeeded.
+    /// Local copy of the file under `<chat dir>/inbox/`, when the download
+    /// succeeded.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file: Option<EventFile>,
 }
 
 /// A downloaded copy of inbound media inside the chat dir. `path` is
-/// relative to the agent's working directory so it can open the file with
-/// ordinary file tools; `mime` is guessed from the downloaded name.
+/// absolute so every harness's file tools resolve it the same way
+/// (relative paths land wherever the harness defaults — agy's scratch
+/// dir, not the session cwd); `mime` is guessed from the downloaded name.
 #[derive(Debug, Clone, Serialize)]
 pub struct EventFile {
-    /// Path relative to the agent cwd (`inbox/<file_unique_id>.<ext>`).
+    /// Absolute path (`<chat dir>/inbox/<file_unique_id>.<ext>`).
     pub path: String,
     /// MIME type guessed from the file extension.
     pub mime: String,
@@ -121,8 +122,8 @@ pub struct EventMedia {
     pub kind: &'static str,
     /// Telegram `file_id` — resendable via `send_file`.
     pub file_id: String,
-    /// Local copy of the file inside the chat dir (`inbox/…`), when the
-    /// download succeeded.
+    /// Local copy of the file under `<chat dir>/inbox/`, when the download
+    /// succeeded.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file: Option<EventFile>,
 }
@@ -282,7 +283,7 @@ mod tests {
                 set_name: Some("pack_by_bot".to_string()),
                 format: "static",
                 file: Some(EventFile {
-                    path: "inbox/CAACAgE.webp".to_string(),
+                    path: "/data/chats/shared/inbox/CAACAgE.webp".to_string(),
                     mime: "image/webp".to_string(),
                 }),
             }),
@@ -293,7 +294,10 @@ mod tests {
         let json = base.to_prompt_text();
         assert!(json.contains("\"file_id\":\"CAACAgE\""), "{json}");
         assert!(json.contains("\"set_name\":\"pack_by_bot\""), "{json}");
-        assert!(json.contains("\"path\":\"inbox/CAACAgE.webp\""), "{json}");
+        assert!(
+            json.contains("\"path\":\"/data/chats/shared/inbox/CAACAgE.webp\""),
+            "{json}"
+        );
         assert!(json.contains("\"mime\":\"image/webp\""), "{json}");
         assert!(!json.contains("\"media\""), "{json}");
         assert!(!json.contains("\"reaction\""), "{json}");
