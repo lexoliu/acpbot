@@ -10,6 +10,8 @@ mod agent;
 mod agy;
 mod bot;
 mod bridge;
+mod browser;
+mod cdp;
 mod chat;
 mod config;
 mod error;
@@ -213,6 +215,7 @@ fn run(config_path: &Path) -> Result<(), MainError> {
         config.persona.clone(),
         sender_for,
         sticker_library,
+        config.browser,
         config.platform.name(),
     );
     // Kept, not detached: on shutdown the dispatcher's drop chain is what
