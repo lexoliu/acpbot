@@ -131,6 +131,7 @@ fn run(config_path: &Path) -> Result<(), MainError> {
                 );
             }
             info!(bot = ?me.username, id = me.id, "bot identity");
+            let bot_id = me.id;
             let me = bot::BotIdentity {
                 id: me.id,
                 username: me.username.clone(),
@@ -147,6 +148,7 @@ fn run(config_path: &Path) -> Result<(), MainError> {
                         thread,
                         last_action,
                         stickers.clone(),
+                        bot_id,
                     )
                 }),
                 Box::pin(bot.run_until(shutdown)),

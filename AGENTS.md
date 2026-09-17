@@ -72,6 +72,15 @@ must do the same (see `ensure_executor` in test modules).
 - `tracing` for diagnostics, never `println!` (except `mcp-bridge`, which is a
   byte-level stdio pipe by design).
 
+## Tuning the agent
+
+The one shared agent is this bot's UI main thread: while its turn runs,
+every chat waits. Keep the main turn short — ack, hand the task to a
+background subagent, end the turn; relay the result to the asking chat when
+the subagent reports back. Tooling, prompts, and the managed `AGENTS.md`
+block (`PROTOCOL_DOC` in `agent.rs`) all tune toward that: work happens in
+subagents, the main turn only talks and dispatches.
+
 ## Config
 
 See `acpbot.example.toml`. `[platform]` selects `telegram` (token/token_env),

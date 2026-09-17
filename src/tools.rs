@@ -109,6 +109,18 @@ pub fn chat_tools(router: Arc<ChatRouter>, restart: ChanSender<()>) -> Tools {
     register(&mut tools, ListStickerSets { library });
     register(
         &mut tools,
+        ChatInfo {
+            router: router.clone(),
+        },
+    );
+    register(
+        &mut tools,
+        FetchMessage {
+            router: router.clone(),
+        },
+    );
+    register(
+        &mut tools,
         ChatHistory {
             router: router.clone(),
         },
@@ -961,6 +973,98 @@ async fn annotate_deleted(records: &mut [serde_json::Value], sender: &Sender, hi
     }
 }
 
+/// Look up a chat's metadata and the bot's access to it.
+struct ChatInfo {
+    router: Arc<ChatRouter>,
+}
+
+/// Arguments for `chat_info`.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ChatInfoArgs {
+    /// The chat to look up: a numeric id, an @username, or a t.me link
+    /// (`t.me/<name>`, `t.me/c/<id>` — a message link works too).
+    chat: String,
+}
+
+impl Tool for ChatInfo {
+    type Arguments = ChatInfoArgs;
+    type Res = ToolResult;
+
+    fn name(&self) -> std::borrow::Cow<'static, str> {
+        "chat_info".into()
+    }
+
+    fn description(&self) -> std::borrow::Cow<'static, str> {
+        "Look up a chat through the bot's Telegram identity: type, title, \
+         description, member count, and `bot_status` — whether the bot sits \
+         in it. `chat` takes a numeric id, an @username, or a t.me link \
+         (invite links cannot resolve). `readable: true` means the bot is a \
+         member, so its events reach you and `history`/`fetch_message` work \
+         there; for a chat you can't reach, ask the user to add the bot."
+            .into()
+    }
+
+    async fn call(&self, args: Self::Arguments) -> aither_core::Result<Self::Res> {
+        // Any sender is a valid platform handle — the lookup isn't bound to
+        // the chat it was invoked from; the current chat's sender is used.
+        let sender = match target(&self.router, None) {
+            Ok(sender) => sender,
+            Err(result) => return Ok(result),
+        };
+        match sender.chat_info(&args.chat).await {
+            Ok(info) => Ok(ToolResult::text(info.to_string())),
+            Err(error) => Ok(ToolResult::error(error.to_string())),
+        }
+    }
+}
+
+/// Read one message out of a chat by id or link.
+struct FetchMessage {
+    router: Arc<ChatRouter>,
+}
+
+/// Arguments for `fetch_message`.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct FetchMessageArgs {
+    /// The chat holding the message: a numeric id, an @username, or a t.me
+    /// link — a message link (`t.me/<name>/<id>`, `t.me/c/<id>/<msg>`)
+    /// supplies `message_id` itself.
+    chat: String,
+    /// The message id — required unless `chat` is a message link.
+    message_id: Option<i64>,
+}
+
+impl Tool for FetchMessage {
+    type Arguments = FetchMessageArgs;
+    type Res = ToolResult;
+
+    fn name(&self) -> std::borrow::Cow<'static, str> {
+        "fetch_message".into()
+    }
+
+    fn description(&self) -> std::borrow::Cow<'static, str> {
+        "Read one message from a chat the bot belongs to: briefly forwards it \
+         into the current chat to read it, then deletes the copy. `chat` is \
+         the SOURCE — numeric id, @username, or a t.me message link (which \
+         carries the message id). Only membership chats answer: for one the \
+         bot isn't in, the call fails — ask the user to add the bot instead."
+            .into()
+    }
+
+    async fn call(&self, args: Self::Arguments) -> aither_core::Result<Self::Res> {
+        // The scratch copy lands in the current chat — `chat` names the
+        // source, not the routing target.
+        let sender = match target(&self.router, None) {
+            Ok(sender) => sender,
+            Err(result) => return Ok(result),
+        };
+        match sender.fetch_message(&args.chat, args.message_id).await {
+            Ok(message) => Ok(ToolResult::text(message.to_string())),
+            Err(error) => Ok(ToolResult::error(error.to_string())),
+        }
+    }
+}
+
 /// Read back a chat's transcript: every inbound event and outbound action,
 /// newest `limit` inside the range.
 struct ChatHistory {
@@ -1197,8 +1301,10 @@ mod tests {
         assert_eq!(
             names,
             [
+                "chat_info",
                 "delete_message",
                 "edit_message",
+                "fetch_message",
                 "history",
                 "import_sticker_set",
                 "list_sticker_sets",
