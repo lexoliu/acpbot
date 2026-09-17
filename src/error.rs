@@ -56,6 +56,17 @@ pub enum SenderError {
     /// The chat key's id cannot map to this platform's addressing.
     #[error("telegram chat id {0:?} is not numeric")]
     NonNumericChat(String),
+    /// A `chat` argument could not be resolved to a platform address.
+    #[error(
+        "cannot read {0:?} as a chat — pass a numeric id, an @username, or a t.me link (invite links do not resolve)"
+    )]
+    BadChatRef(String),
+    /// `fetch_message` got neither a `message_id` argument nor a message link.
+    #[error("no message id — pass `message_id` or a t.me/<chat>/<id> message link")]
+    MissingMessageId,
+    /// The platform cannot perform this operation.
+    #[error("{0} is not supported on this platform")]
+    Unsupported(&'static str),
     /// The target message is gone — deleted since it was sent.
     #[error("message {0} no longer exists — it was deleted")]
     MessageGone(i64),

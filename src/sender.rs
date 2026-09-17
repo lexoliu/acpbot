@@ -15,7 +15,7 @@ use botkit_core::{BotError, FileSource};
 use botkit_discord::DiscordClient;
 use botkit_discord::action::DiscordActionSender;
 use botkit_telegram::action::TelegramActionSender;
-use botkit_telegram::{InlineKeyboardMarkup, MediaKind, ReplyMarkup, TelegramClient};
+use botkit_telegram::{ChatRef, InlineKeyboardMarkup, MediaKind, ReplyMarkup, TelegramClient};
 use tracing::warn;
 
 use botkit_cli::wire::{
@@ -216,6 +216,8 @@ pub struct DiscordSender {
 pub struct TelegramSender {
     client: TelegramClient,
     chat_id: i64,
+    /// The bot's own user id — `getChatMember` probes membership with it.
+    bot_id: i64,
     /// The bot-owned sticker set pack files publish into.
     stickers: Arc<StickerSet>,
 }
@@ -229,6 +231,7 @@ impl Sender {
         thread: Arc<AtomicI64>,
         last_action: Arc<AtomicU64>,
         stickers: Arc<StickerSet>,
+        bot_id: i64,
     ) -> Result<Self, SenderError> {
         debug_assert_eq!(key.platform, "telegram");
         let chat_id: i64 = key
@@ -239,6 +242,7 @@ impl Sender {
             platform: Platform::Telegram(TelegramSender {
                 client,
                 chat_id,
+                bot_id,
                 stickers,
             }),
             spoke,
@@ -1092,6 +1096,108 @@ impl Sender {
         }
     }
 
+    /// Look up a chat the bot can see — `query` is a numeric id, an
+    /// `@username`, or a `t.me` link. Returns the public metadata plus the
+    /// bot's own membership status; a chat the bot cannot reach answers
+    /// the platform's error.
+    pub async fn chat_info(&self, query: &str) -> Result<serde_json::Value, SenderError> {
+        match &self.platform {
+            Platform::Telegram(inner) => {
+                let (chat, _message) = telegram_ref(query)?;
+                let info = inner.client.get_chat(chat.clone()).await?;
+                let members = inner.client.get_chat_member_count(chat.clone()).await.ok();
+                let status = inner
+                    .client
+                    .get_chat_member(chat, inner.bot_id)
+                    .await
+                    .map(|member| member.status)
+                    .unwrap_or_else(|_| "not a member".to_string());
+                // Only chats the bot sits in push it events (or answer
+                // fetch_message) — `restricted`/`left`/`kicked` don't.
+                let readable = matches!(status.as_str(), "creator" | "administrator" | "member");
+                Ok(serde_json::json!({
+                    "id": info.id,
+                    "type": format!("{:?}", info.chat_type).to_lowercase(),
+                    "title": info.title,
+                    "username": info.username,
+                    "first_name": info.first_name,
+                    "description": info.description,
+                    "bio": info.bio,
+                    "invite_link": info.invite_link,
+                    "linked_chat_id": info.linked_chat_id,
+                    "has_visible_history": info.has_visible_history,
+                    "members": members,
+                    "bot_status": status,
+                    "readable": readable,
+                }))
+            }
+            _ => Err(SenderError::Unsupported("chat_info")),
+        }
+    }
+
+    /// Read one message out of a chat the bot belongs to: `forwardMessage`
+    /// lands a copy in this sender's chat whose response carries the
+    /// content; the copy is deleted right after. `query` accepts the same
+    /// forms as [`Self::chat_info`] — a message link (`t.me/<c>/<id>`)
+    /// supplies `message_id` itself.
+    pub async fn fetch_message(
+        &self,
+        query: &str,
+        message_id: Option<i64>,
+    ) -> Result<serde_json::Value, SenderError> {
+        match &self.platform {
+            Platform::Telegram(inner) => {
+                let (chat, linked) = telegram_ref(query)?;
+                let message_id = message_id.or(linked).ok_or(SenderError::MissingMessageId)?;
+                let message = inner
+                    .client
+                    .forward_message(inner.chat_id, chat, message_id)
+                    .await?;
+                // The forwarded copy was only a way to read the source —
+                // remove it so nothing user-visible is left behind.
+                let _ = inner
+                    .client
+                    .delete_message(inner.chat_id, message.message_id)
+                    .await;
+                let media = if message.sticker.is_some() {
+                    Some("sticker")
+                } else if message.photo.is_some() {
+                    Some("photo")
+                } else if message.animation.is_some() {
+                    Some("animation")
+                } else if message.video.is_some() {
+                    Some("video")
+                } else if message.audio.is_some() {
+                    Some("audio")
+                } else if message.voice.is_some() {
+                    Some("voice")
+                } else if message.document.is_some() {
+                    Some("document")
+                } else {
+                    None
+                };
+                // The copy's own `from` is the bot; the original author
+                // lives on `forward_origin`.
+                let from = message.forward_origin.and_then(|origin| {
+                    origin
+                        .sender_user
+                        .map(|u| u.username.unwrap_or(u.first_name))
+                        .or(origin.sender_user_name)
+                        .or_else(|| origin.chat.and_then(|c| c.title.or(c.username)))
+                });
+                Ok(serde_json::json!({
+                    "message_id": message_id,
+                    "date": message.date,
+                    "from": from,
+                    "text": message.text,
+                    "caption": message.caption,
+                    "media": media,
+                }))
+            }
+            _ => Err(SenderError::Unsupported("fetch_message")),
+        }
+    }
+
     /// Show "typing…" in the chat until the returned guard is dropped.
     pub fn typing_guard(&self) -> ChatActionGuard {
         match &self.platform {
@@ -1138,6 +1244,53 @@ impl DiscordSender {
             .await
             .map(|m| snowflake_id(&m.id))
     }
+}
+
+/// Parse the `chat` argument of the lookup tools: a numeric id, an
+/// `@username` (a bare word counts), or a `t.me`/`telegram.me` link. A
+/// message link (`t.me/<name>/<msg>`, `t.me/c/<internal>/<msg>`) also
+/// yields its message id; `t.me/c/<internal>` maps to the `-100…` chat id
+/// form the API uses. Invite links (`t.me/+…`, `joinchat`) cannot resolve
+/// — the Bot API has no invite lookup.
+fn telegram_ref(raw: &str) -> Result<(ChatRef, Option<i64>), SenderError> {
+    let bad = || SenderError::BadChatRef(raw.to_string());
+    let mut s = raw.trim().strip_prefix("telegram:").unwrap_or(raw.trim());
+    for prefix in ["https://", "http://"] {
+        s = s.strip_prefix(prefix).unwrap_or(s);
+    }
+    for host in ["t.me/", "telegram.me/", "telegram.dog/"] {
+        s = s.strip_prefix(host).unwrap_or(s);
+    }
+    // `t.me/s/<name>` is the web-preview form of `t.me/<name>`.
+    s = s.strip_prefix("s/").unwrap_or(s);
+    if let Ok(id) = s.parse::<i64>() {
+        return Ok((ChatRef::Id(id), None));
+    }
+    let mut segments = s.split('/');
+    let head = segments.next().unwrap_or_default();
+    if head == "c" {
+        // Private-link form: the internal channel id becomes -100…
+        return segments
+            .next()
+            .and_then(|id| id.parse::<i64>().ok())
+            .map(|internal| {
+                (
+                    ChatRef::Id(-(1_000_000_000_000 + internal)),
+                    segments.next().and_then(|msg| msg.parse::<i64>().ok()),
+                )
+            })
+            .ok_or_else(bad);
+    }
+    let name = head.strip_prefix('@').unwrap_or(head);
+    if name.is_empty()
+        || name.starts_with('+')
+        || name == "joinchat"
+        || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Err(bad());
+    }
+    let message_id = segments.next().and_then(|msg| msg.parse::<i64>().ok());
+    Ok((ChatRef::Username(format!("@{name}")), message_id))
 }
 
 /// A Discord snowflake id as the `i64` ids the tool layer uses. Real
@@ -1454,6 +1607,7 @@ mod tests {
                 None,
                 None,
             )),
+            0,
         )
         .expect("telegram sender");
 
@@ -1470,5 +1624,42 @@ mod tests {
             ));
         }));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The `chat` argument's many spellings all land on one `ChatRef`.
+    #[test]
+    fn telegram_ref_forms() {
+        let id = |raw| match telegram_ref(raw) {
+            Ok((ChatRef::Id(id), msg)) => (id, msg),
+            other => panic!("{raw} → {other:?}"),
+        };
+        let name = |raw| match telegram_ref(raw) {
+            Ok((ChatRef::Username(name), msg)) => (name, msg),
+            other => panic!("{raw} → {other:?}"),
+        };
+
+        assert_eq!(id("-1002495551562"), (-1002495551562, None));
+        assert_eq!(id("telegram:-1002495551562"), (-1002495551562, None));
+        assert_eq!(id("t.me/c/2495551562/42"), (-1002495551562, Some(42)));
+        assert_eq!(id("https://t.me/c/2495551562"), (-1002495551562, None));
+        assert_eq!(name("@durov"), ("@durov".to_string(), None));
+        assert_eq!(name("durov"), ("@durov".to_string(), None));
+        assert_eq!(name("t.me/durov/42"), ("@durov".to_string(), Some(42)));
+        assert_eq!(
+            name("https://t.me/s/durov/42"),
+            ("@durov".to_string(), Some(42))
+        );
+
+        for bad in [
+            "t.me/+AbCdEf",
+            "https://t.me/joinchat/AbCdEf",
+            "not a chat",
+            "",
+        ] {
+            assert!(
+                matches!(telegram_ref(bad), Err(SenderError::BadChatRef(_))),
+                "{bad}"
+            );
+        }
     }
 }

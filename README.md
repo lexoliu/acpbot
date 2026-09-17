@@ -13,10 +13,13 @@ MCP tools served by the same binary.
   agent process and session; the agent's only way to speak is through
   chat tools (`send_message`, `reply`, `send_file`, `send_sticker`,
   `react`, `edit_message`, `delete_message`, `pin_message`,
-  `message_status`, `history`, `search_history`, sticker-set tools,
-  `restart`). Chat-bound tools take an optional `chat` argument — a bare
-  chat id or `platform:id`; omitted, a call lands in the chat whose
-  events triggered the current turn.
+  `message_status`, `history`, `search_history`, `chat_info`,
+  `fetch_message`, sticker-set tools, `restart`). Chat-bound tools take an
+  optional `chat` argument — a bare chat id or `platform:id`; omitted, a
+  call lands in the chat whose events triggered the current turn.
+  `chat_info` resolves a chat by id, @username, or `t.me` link and reports
+  the bot's membership; `fetch_message` reads one message out of a chat
+  the bot belongs to.
 - Telegram support covers native stickers (including importing foreign
   sticker sets), reactions, edits, deletes, pins, inline keyboards, forum
   topics, and group attention classification (`direct` vs `ambient`).
