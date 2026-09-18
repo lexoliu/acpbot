@@ -770,6 +770,7 @@ mod tests {
     /// process.
     #[test]
     fn stdout_eof_early_still_waits_for_exit() {
+        ensure_executor();
         let dir = tempdir("eof");
         let (watchers, rx) = watchers(&dir);
         watchers
