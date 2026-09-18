@@ -227,6 +227,12 @@ pub struct AgentConfig {
     /// `0` disables the nudge.
     #[serde(default = "default_nudge_after_secs")]
     pub nudge_after_secs: u64,
+    /// Seconds of total session silence allowed while a tool call is in
+    /// flight before the turn is treated as hung and cancelled (default
+    /// 1200 — a `web_search`/`exec`/subagent working quietly is normal;
+    /// past this the call is presumed dead). `0` waits forever.
+    #[serde(default = "default_tool_silence_secs")]
+    pub tool_silence_secs: u64,
 }
 
 /// How the agent process is isolated from the host.
@@ -378,6 +384,10 @@ fn default_nudge_after_secs() -> u64 {
     10
 }
 
+fn default_tool_silence_secs() -> u64 {
+    1200
+}
+
 impl AgentConfig {
     /// The quiet stretch that triggers one idle compaction.
     pub fn idle_compact(&self) -> std::time::Duration {
@@ -387,6 +397,11 @@ impl AgentConfig {
     /// The outbound silence that triggers a nudge mid-turn.
     pub fn nudge_after(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.nudge_after_secs)
+    }
+
+    /// The session silence that ends a turn stuck inside a tool call.
+    pub fn tool_silence(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.tool_silence_secs)
     }
 }
 
@@ -400,6 +415,7 @@ impl Default for AgentConfig {
             isolation: AgentIsolation::default(),
             idle_compact_secs: default_idle_compact_secs(),
             nudge_after_secs: default_nudge_after_secs(),
+            tool_silence_secs: default_tool_silence_secs(),
         }
     }
 }

@@ -562,6 +562,7 @@ impl Dispatcher {
             blocked_rx,
             blocked_tx,
             last_action,
+            activity: Arc::new(crate::handler::Activity::default()),
             restart_tx,
             restart_rx,
             shutdown_rx: self.shutdown.1.clone(),
@@ -648,6 +649,10 @@ struct ChatActor {
     /// Epoch ms of the agent's last outbound action — every sender writes
     /// it through `spoke`; the nudge watchdog reads it to measure silence.
     last_action: Arc<AtomicU64>,
+    /// Live session-activity signals the ACP handler writes — the watchdog
+    /// reads them so a turn doing quiet tool work isn't mistaken for a
+    /// stuck one.
+    activity: Arc<crate::handler::Activity>,
     /// Closes when the daemon shuts down; an in-flight turn aborts on it so
     /// the runtime (and its sandboxed agent) is dropped, not orphaned.
     shutdown_rx: Receiver<()>,
@@ -1116,9 +1121,52 @@ impl ChatActor {
         outcome
     }
 
+    /// The watchdog's view of the live turn: how long the session has
+    /// been completely mute (no outbound chat action *and* no session
+    /// update of any kind), and the silence budget that applies —
+    /// `tool_silence` while a tool call is in flight (quiet `exec`/
+    /// `web_search`/subagent work is legitimate, not stuckness),
+    /// `nudge_after` otherwise. A zero budget waits forever.
+    fn silence(&self) -> (Duration, Duration) {
+        let idle_ms = crate::sender::epoch_ms().saturating_sub(
+            self.last_action
+                .load(Ordering::Relaxed)
+                .max(self.activity.last_update.load(Ordering::Relaxed)),
+        );
+        let busy = self.activity.busy();
+        let tool_silence = self.shared.agent.tool_silence();
+        let nudge_after = self.shared.agent.nudge_after();
+        let budget = if busy && tool_silence.is_zero() {
+            Duration::MAX
+        } else if busy {
+            tool_silence
+        } else {
+            nudge_after
+        };
+        (Duration::from_millis(idle_ms), budget)
+    }
+
+    /// Cancel the in-flight turn and drop the bookkeeping that belonged
+    /// to it: killed tool calls may never report a terminal status, so
+    /// the next prompt starts with an empty `live_tools` and a fresh
+    /// activity clock.
+    async fn cancel_turn(
+        &self,
+        client: &AcpClient<BotClientHandler>,
+        session_id: &str,
+        prompt: &mut Pin<Box<dyn Future<Output = Result<PromptResult, ClientError>> + Send + '_>>,
+    ) {
+        cancel_and_settle(client, session_id, prompt).await;
+        self.activity.clear_tools();
+        self.activity
+            .last_update
+            .store(crate::sender::epoch_ms(), Ordering::Relaxed);
+    }
+
     /// Run one prompt to completion, enforcing the never-keep-them-waiting
     /// rule: whenever the agent stays silent past
-    /// `[agent] nudge_after_secs`, the turn is cancelled and re-prompted
+    /// `[agent] nudge_after_secs` — or `[agent] tool_silence_secs` while a
+    /// tool call is in flight — the turn is cancelled and re-prompted
     /// with a `nudge` event so the agent sends the user an update and
     /// resumes its work. `0` disables the nudge entirely.
     ///
@@ -1162,9 +1210,10 @@ impl ChatActor {
                 if nudge_after.is_zero() {
                     std::future::pending::<()>().await;
                 }
-                let silent_ms = crate::sender::epoch_ms()
-                    .saturating_sub(self.last_action.load(Ordering::Relaxed));
-                let remaining = nudge_after.saturating_sub(Duration::from_millis(silent_ms));
+                // Cap the sleep at `nudge_after`: `busy` can drop
+                // mid-wait and the budget must re-tighten promptly.
+                let (idle, budget) = self.silence();
+                let remaining = budget.saturating_sub(idle).min(nudge_after);
                 async_io::Timer::after(remaining).await;
                 Race::Tick
             };
@@ -1195,7 +1244,7 @@ impl ChatActor {
                 // Cancel before yielding the session: the shutdown handoff
                 // prompt can't run while this turn is still in flight.
                 Race::Shutdown => {
-                    cancel_and_settle(client, session_id, &mut prompt).await;
+                    self.cancel_turn(client, session_id, &mut prompt).await;
                     return Ok(PromptEnd::Shutdown);
                 }
                 Race::EventsClosed => events_open = false,
@@ -1210,7 +1259,7 @@ impl ChatActor {
                         .is_some_and(|current| current == key_of(&event));
                     if event.is_stop() && owns_turn {
                         info!(chat = %key_of(&event), "user said stop; cancelling turn");
-                        cancel_and_settle(client, session_id, &mut prompt).await;
+                        self.cancel_turn(client, session_id, &mut prompt).await;
                         return Ok(PromptEnd::Stopped);
                     }
                     // Pulled but not yet prompted — journal it so a crash
@@ -1220,25 +1269,31 @@ impl ChatActor {
                     pending.push(*event);
                 }
                 Race::Tick => {
-                    let silent_ms = crate::sender::epoch_ms()
-                        .saturating_sub(self.last_action.load(Ordering::Relaxed));
-                    if silent_ms < nudge_after.as_millis() as u64 {
+                    let (idle, budget) = self.silence();
+                    if idle < budget {
                         continue;
                     }
+                    let busy = self.activity.busy();
                     warn!(
                         chat = ?self.router.current(),
-                        silent_ms, "agent silent past the nudge deadline; interrupting"
+                        silent_ms = idle.as_millis() as u64,
+                        busy, "agent silent past the nudge deadline; interrupting"
                     );
-                    cancel_and_settle(client, session_id, &mut prompt).await;
+                    self.cancel_turn(client, session_id, &mut prompt).await;
                     // The nudged turn gets a fresh silence budget — it must
                     // still speak within `nudge_after` or be interrupted
                     // again.
                     self.last_action
                         .store(crate::sender::epoch_ms(), Ordering::Relaxed);
+                    let text = if busy {
+                        tool_stall_event_text(self.router.current().as_ref())
+                    } else {
+                        nudge_event_text(self.router.current().as_ref())
+                    };
                     prompt = Box::pin(client.prompt(PromptParams::new(
                         session_id,
                         vec![ContentBlock::Text(TextContent {
-                            text: nudge_event_text(self.router.current().as_ref()),
+                            text,
                             annotations: None,
                             meta: None,
                         })],
@@ -1249,7 +1304,7 @@ impl ChatActor {
                         chat = ?self.router.current(),
                         tool, "command tool on the shared thread; cancelling turn"
                     );
-                    cancel_and_settle(client, session_id, &mut prompt).await;
+                    self.cancel_turn(client, session_id, &mut prompt).await;
                     // Reports can still land while the cancellation
                     // settles — drop them so the caller's re-prompt
                     // doesn't trip over a dead turn's calls.
@@ -1298,6 +1353,7 @@ impl ChatActor {
             self.transcript_path(),
             self.compact_supported.clone(),
             self.blocked_tx.clone(),
+            self.activity.clone(),
         );
         let spawned = self
             .runtime
@@ -1610,7 +1666,7 @@ impl ChatActor {
         {
             Outcome::Done(result) => result.map(|_| ()),
             Outcome::TimedOut => {
-                cancel_and_settle(client, session_id, &mut prompt).await;
+                self.cancel_turn(client, session_id, &mut prompt).await;
                 Err(ClientError::Transport(format!(
                     "maintenance prompt timed out after {HANDOFF_TIMEOUT:?}"
                 )))
@@ -1762,6 +1818,18 @@ fn nudge_event_text(chat: Option<&ChatKey>) -> String {
         chat,
         "You have been silent too long — the user is waiting. Send a \
          short update now, then continue the task you were doing.",
+    )
+}
+
+/// The `nudge` injected when a turn was cancelled because a tool call
+/// stayed silent past `tool_silence` — the call was killed as presumed
+/// hung, so "continue" means retry differently, not wait for it.
+fn tool_stall_event_text(chat: Option<&ChatKey>) -> String {
+    nudge_event(
+        chat,
+        "A tool call ran far too long and was killed — it probably hung. \
+         Tell the user briefly, then retry the job a different way \
+         (smaller steps, another tool, or a subagent) or give up on it.",
     )
 }
 
@@ -2084,10 +2152,14 @@ no events, so talking to yourself just spams the room. One thought shy \
 always beats one bubble too many.
 
 **Never go dark mid-task.** The user must never wait more than ten seconds \
-with nothing from you. The daemon enforces it: a turn with no `chat` tool \
-call for ten seconds is cancelled and re-prompted as a `nudge` event — \
-and a turn that *ends* having never called one gets re-prompted too, \
-because the answer you typed went nowhere. \
+with nothing from you. The daemon enforces it: a turn that produces \
+nothing — no `chat` call, no tool progress, not even thinking output — \
+for ten seconds is cancelled and re-prompted as a `nudge` event. A tool \
+call in flight gets a long leash instead (`tool_silence_secs`, twenty \
+minutes by default): quiet work is legitimate, but past that the call is \
+killed as hung — say so and retry differently. And a turn that *ends* \
+having never called a `chat` tool gets re-prompted too, because the \
+answer you typed went nowhere. \
 When a `nudge` arrives, your FIRST action is again a `chat` tool call — \
 one line like \\\"still working, X so far\\\" — then you continue the task \
 you were doing. Plan for it: on anything long, send a progress line \
