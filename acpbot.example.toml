@@ -89,6 +89,31 @@ kind = "native"
 # [agent.isolation]
 # kind = "none"
 
+# Extra MCP servers merged into the session's `.devin/mcp_config.json`
+# next to the built-in `chat` entry. The agent spawns them inside its
+# sandbox, so under kind = "native" give `command` an absolute path and
+# grant the binary plus its state directories via [agent.isolation]
+# (state_dirs for rw+create, grants for execute). Example: `acpsub` as a
+# subagent server (devin swe-2-max + gemini via agy-bridge backends —
+# see ~/.config/acpsub/config.toml):
+# [[agent.mcp_servers]]
+# name = "acpsub"
+# command = "~/.cargo/bin/acpsub"
+# args = ["serve"]
+# env = {}                      # optional extra environment
+# Requires, for the acpsub+agy backends:
+# [agent.isolation]
+# state_dirs = ["~/.devin", "~/.config/devin", "~/.config/acpsub", "~/.local/share/acpsub"]
+# [[agent.isolation.grants]]
+# path = "~/.cargo/bin/acpsub"
+# access = "rx"
+# [[agent.isolation.grants]]
+# path = "~/.local/bin/agy"
+# access = "rx"
+# [[agent.isolation.grants]]
+# path = "~/.gemini"
+# access = "rwx"
+
 # Antigravity instead of devin: `agy-bridge` is an ACP server inside this
 # binary that spawns `agy` per turn and threads its conversation id across
 # them. It needs `kind = "none"` — the sandbox would block agy's own
