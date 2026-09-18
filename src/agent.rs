@@ -150,6 +150,17 @@ chat records — `history`, `search_history`, `fetch_message`, `chat_info` \
 hold every message the bot saw or sent and outlive any session. Absorb it \
 quietly — no `chat` tool calls, nobody is waiting — then end the turn.";
 
+/// Outbound records per chat folded into the continuity inject. A
+/// resumed incarnation re-does whatever the handoff says was in flight,
+/// and without this list it cannot see which sends already landed —
+/// the resume-time dupes (a lead-in text sent twice) come from that
+/// blindness.
+const INJECT_OUTBOUND_PER_CHAT: usize = 6;
+
+/// One injected record's rendered length cap — a long caption or file
+/// path must not bloat the bootstrap prompt.
+const INJECT_RECORD_MAX_CHARS: usize = 240;
+
 /// The [`ChatKey`] an event belongs to.
 fn key_of(event: &ChatEvent) -> ChatKey {
     ChatKey {
@@ -1642,12 +1653,56 @@ impl ChatActor {
             return;
         }
         info!("injecting continuity summary into new session");
-        if let Err(error) = self
-            .maintenance_prompt(client, session_id, format!("{INJECT_PROMPT}\n\n{text}"))
-            .await
-        {
+        let prompt = format!("{INJECT_PROMPT}\n\n{text}{}", self.recent_outbound());
+        if let Err(error) = self.maintenance_prompt(client, session_id, prompt).await {
             warn!(%error, "continuity inject failed");
         }
+    }
+
+    /// The tail of every known chat's outbound record, rendered for the
+    /// continuity inject. Reads `history.jsonl` files directly — the
+    /// router's `history()` would also `note_outbound` into the registry,
+    /// which is a lie for a read. Empty when nothing was ever sent.
+    fn recent_outbound(&self) -> String {
+        let mut section = String::new();
+        for (key, record) in self.router.chats() {
+            let Some((platform, id)) = key.split_once(':') else {
+                continue;
+            };
+            let history = History::open(history_path(
+                &self.shared.data_dir.join("chats").join(
+                    ChatKey {
+                        platform: platform.to_owned(),
+                        id: id.to_owned(),
+                    }
+                    .slug(),
+                ),
+            ));
+            let records = history.tail_outbound(INJECT_OUTBOUND_PER_CHAT);
+            if records.is_empty() {
+                continue;
+            }
+            if section.is_empty() {
+                section.push_str(
+                    "\n\n## Outbound actions your previous self already committed\n\
+                    These landed before the restart — do not resend them; \
+                    verify against `history` when in doubt.\n",
+                );
+            }
+            match &record.title {
+                Some(title) => section.push_str(&format!("\n`{key}` ({title}):\n")),
+                None => section.push_str(&format!("\n`{key}`:\n")),
+            }
+            for record in records {
+                let mut line = serde_json::to_string(&record).unwrap_or_default();
+                if line.chars().count() > INJECT_RECORD_MAX_CHARS {
+                    line = line.chars().take(INJECT_RECORD_MAX_CHARS).collect();
+                    line.push('…');
+                }
+                section.push_str(&format!("  {line}\n"));
+            }
+        }
+        section
     }
 
     /// A prompt with no typing, no nudges, and a hard bound — shutdown

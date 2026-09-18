@@ -35,7 +35,10 @@ must do the same (see `ensure_executor` in test modules).
   spawns the ACP process at daemon start (process, handshake, `session/new`,
   and the continuity inject are all paid before the first event arrives),
   always opens a *fresh* session and injects the previous incarnation's
-  `CONTINUITY.md` as the bootstrap prompt; before a clean close it asks
+  `CONTINUITY.md` as the bootstrap prompt — plus a tail of each chat's
+  recent outbound actions (`INJECT_OUTBOUND_PER_CHAT`), so a resumed
+  incarnation sees which sends already landed instead of re-doing an
+  interrupted turn's outbound half; before a clean close it asks
   the agent to (re)write that file.
   A session id in `sessions.json` is a "died before handoff" marker — the
   next spawn restores it only to extract the summary, never to resume.
