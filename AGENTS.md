@@ -51,7 +51,11 @@ must do the same (see `ensure_executor` in test modules).
   turn's triggering chat, which tools' optional `chat` argument defaults to.
 - `sender.rs` — `Platform` enum (`Telegram`, `Discord`, `Cli`, test `Record`):
   every
-  outbound tool call lands here. Telegram-bound text (and media captions)
+  outbound tool call lands here. Text first passes `unescape_escapes`,
+  which rewrites the JSON escapes the model sometimes emits literally
+  (`\n`, `\t`, `\uXXXX`, …) into real characters while skipping code
+  spans/fences and preserving markdown escapes like `\*`. Telegram-bound
+  text (and media captions)
   is rendered from markdown into `entities` via
   `botkit_telegram::markdown::render` — offsets computed here, so emphasis
   next to CJK or full-width punctuation works and no `parse_mode` escaping

@@ -104,6 +104,137 @@ fn fenced_line_ends(text: &str) -> Vec<usize> {
     points
 }
 
+/// Consume a `\uXXXX` escape — `it` sits on the `u` — including a
+/// `D800`-`DBFF` + `DC00`-`DFFF` surrogate pair. Returns `None` and leaves
+/// the iterator untouched when the escape is malformed.
+fn unicode_escape(it: &mut std::iter::Peekable<std::str::Chars>) -> Option<char> {
+    fn hex4(it: &mut std::iter::Peekable<std::str::Chars>) -> Option<u32> {
+        let mut v = 0u32;
+        for _ in 0..4 {
+            v = (v << 4) | it.next()?.to_digit(16)?;
+        }
+        Some(v)
+    }
+    let mut probe = it.clone();
+    if probe.next() != Some('u') {
+        return None;
+    }
+    let hi = hex4(&mut probe)?;
+    let (ch, tail) = if (0xd800..0xdc00).contains(&hi) {
+        let mut probe2 = probe.clone();
+        if probe2.next() != Some('\\') || probe2.next() != Some('u') {
+            return None;
+        }
+        let lo = hex4(&mut probe2)?;
+        if !(0xdc00..0xe000).contains(&lo) {
+            return None;
+        }
+        (
+            char::from_u32(0x1_0000 + ((hi - 0xd800) << 10) + (lo - 0xdc00))?,
+            probe2,
+        )
+    } else {
+        (char::from_u32(hi)?, probe)
+    };
+    *it = tail;
+    Some(ch)
+}
+
+/// Rewrite the JSON string escapes the model emits inside text: a literal
+/// `\n`/`\t` pair is almost always an escaping slip, not intent — it
+/// renders as backslash-letter on every platform. Only JSON escapes
+/// (`\n \r \t \\ \" \/ \uXXXX`) are rewritten; markdown escapes like `\*`
+/// keep their backslash so the renderer still sees an escaped `*`, and
+/// `\b`/`\f` stay literal rather than emitting invisible control chars.
+/// The rewrite skips inline `` `code` `` spans and fenced blocks, where
+/// `\n` is meaningful content (a `printf("a\nb")` example must stay
+/// literal).
+fn unescape_escapes(text: &str) -> String {
+    if !text.contains('\\') {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut fence: Option<(char, usize)> = None;
+    let mut code: Option<usize> = None;
+    let mut line_start = true;
+    let mut it = text.chars().peekable();
+    while let Some(c) = it.next() {
+        match c {
+            '`' | '~' => {
+                let mut n = 1;
+                while matches!(it.peek(), Some(&p) if p == c) {
+                    it.next();
+                    n += 1;
+                }
+                if line_start && n >= 3 && code.is_none() {
+                    match fence {
+                        Some((fc, len)) if fc == c && n >= len => fence = None,
+                        None => fence = Some((c, n)),
+                        _ => {}
+                    }
+                } else if c == '`' && fence.is_none() {
+                    match code {
+                        Some(len) if len == n => code = None,
+                        None => code = Some(n),
+                        _ => {}
+                    }
+                }
+                out.extend(std::iter::repeat_n(c, n));
+                line_start = false;
+            }
+            '\n' => {
+                out.push('\n');
+                line_start = true;
+            }
+            '\\' if fence.is_none() && code.is_none() => match it.peek().copied() {
+                Some('n') => {
+                    it.next();
+                    out.push('\n');
+                    line_start = true;
+                }
+                Some('r') => {
+                    it.next();
+                    // `\r\n` collapses into one newline.
+                    let mut look = it.clone();
+                    if look.next() == Some('\\') && look.next() == Some('n') {
+                        it.next();
+                        it.next();
+                    }
+                    out.push('\n');
+                    line_start = true;
+                }
+                Some('t') => {
+                    it.next();
+                    out.push('\t');
+                    line_start = false;
+                }
+                Some('\\') | Some('"') | Some('/') => {
+                    out.push(it.next().expect("peeked char"));
+                    line_start = false;
+                }
+                Some('u') => {
+                    match unicode_escape(&mut it) {
+                        Some(ch) => out.push(ch),
+                        None => out.push('\\'),
+                    }
+                    line_start = false;
+                }
+                _ => {
+                    out.push('\\');
+                    line_start = false;
+                }
+            },
+            _ => {
+                out.push(c);
+                if !c.is_whitespace() {
+                    line_start = false;
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Split a message into chat bubbles the way a person hits enter: at
 /// blank lines first, then — for any still-overlong piece — at single
 /// newlines, then at `。！？!?` sentence ends. Fenced code blocks are
@@ -381,7 +512,8 @@ impl Sender {
         text: &str,
         buttons: Option<InlineKeyboardMarkup>,
     ) -> Result<i64, SenderError> {
-        let bubbles = split_bubbles(text);
+        let text = unescape_escapes(text);
+        let bubbles = split_bubbles(&text);
         let last = bubbles.len() - 1;
         let mut id = 0;
         for (i, bubble) in bubbles.iter().enumerate() {
@@ -449,7 +581,8 @@ impl Sender {
         text: &str,
         buttons: Option<InlineKeyboardMarkup>,
     ) -> Result<i64, SenderError> {
-        let bubbles = split_bubbles(text);
+        let text = unescape_escapes(text);
+        let bubbles = split_bubbles(&text);
         let last = bubbles.len() - 1;
         let mut id = 0;
         for (i, bubble) in bubbles.iter().enumerate() {
@@ -654,6 +787,8 @@ impl Sender {
     /// (`.ogg` → voice note), anything else → document. Returns the
     /// message id.
     pub async fn send_file(&self, path: &Path, caption: Option<&str>) -> Result<i64, SenderError> {
+        let caption = caption.map(unescape_escapes);
+        let caption = caption.as_deref();
         self.inter_message_pause().await;
         self.spoke();
         let id = match &self.platform {
@@ -722,6 +857,8 @@ impl Sender {
         file_id: &str,
         caption: Option<&str>,
     ) -> Result<i64, SenderError> {
+        let caption = caption.map(unescape_escapes);
+        let caption = caption.as_deref();
         self.inter_message_pause().await;
         self.spoke();
         let id = match &self.platform {
@@ -963,9 +1100,10 @@ impl Sender {
 
     /// Edit the text of a message the bot sent.
     pub async fn edit(&self, message_id: i64, text: &str) -> Result<(), SenderError> {
+        let text = unescape_escapes(text);
         let result = match &self.platform {
             Platform::Telegram(inner) => {
-                let md = botkit_telegram::markdown::render(text);
+                let md = botkit_telegram::markdown::render(&text);
                 inner
                     .client
                     .edit_message_text(inner.chat_id, message_id, md.formatted(), None)
@@ -982,7 +1120,7 @@ impl Sender {
             }
             Platform::Discord(inner) => inner
                 .client
-                .edit_message(&inner.channel_id, &message_id.to_string(), text)
+                .edit_message(&inner.channel_id, &message_id.to_string(), &text)
                 .await
                 .map(|_| ())
                 .map_err(|e| bot_err(e, message_id)),
@@ -1519,6 +1657,58 @@ mod tests {
             split_bubbles("first thought\n\nsecond thought\n\n\nthird"),
             vec!["first thought", "second thought", "third"]
         );
+    }
+
+    #[test]
+    fn json_escapes_unescape_outside_code() {
+        assert_eq!(
+            unescape_escapes("a thought\\n\\nanother one"),
+            "a thought\n\nanother one"
+        );
+        assert_eq!(unescape_escapes("tab\\there"), "tab\there");
+        assert_eq!(unescape_escapes("\\\\n stays"), "\\n stays");
+        // An escaped backslash keeps the following n literal.
+        assert_eq!(
+            unescape_escapes("show \\\\n literally"),
+            "show \\n literally"
+        );
+        // `\r\n` collapses into one newline; a lone `\r` is a break too.
+        assert_eq!(unescape_escapes("a\\r\\nb"), "a\nb");
+        assert_eq!(unescape_escapes("a\\rb"), "a\nb");
+        // `\u` escapes decode and surrogate pairs combine.
+        assert_eq!(unescape_escapes("\\u4e2d\\u6587"), "中文");
+        assert_eq!(unescape_escapes("\\ud83d\\ude00"), "😀");
+        assert_eq!(unescape_escapes("say \\\"hi\\\" \\/ ok"), "say \"hi\" / ok");
+    }
+
+    #[test]
+    fn markdown_escapes_keep_their_backslash() {
+        // `\*` is an intentional markdown escape — stripping it would turn
+        // literal asterisks into real emphasis after rendering.
+        assert_eq!(unescape_escapes("\\*not bold\\*"), "\\*not bold\\*");
+        assert_eq!(
+            unescape_escapes("\\_u\\_ \\[x\\] \\`c\\`"),
+            "\\_u\\_ \\[x\\] \\`c\\`"
+        );
+        // Malformed and non-JSON escapes stay literal.
+        assert_eq!(unescape_escapes("\\uzz"), "\\uzz");
+        assert_eq!(unescape_escapes("\\ud83d"), "\\ud83d");
+        assert_eq!(unescape_escapes("a\\bb \\x41"), "a\\bb \\x41");
+    }
+
+    #[test]
+    fn json_escapes_stay_inside_code() {
+        let fenced = "```\nprintf(\"a\\nb\")\n```";
+        assert_eq!(unescape_escapes(fenced), fenced);
+        let inline = "use `a\\nb` not that";
+        assert_eq!(unescape_escapes(inline), inline);
+        // Tilde fences and double-backtick spans count too.
+        let tilde = "~~~\nkeep \\n\n~~~";
+        assert_eq!(unescape_escapes(tilde), tilde);
+        let double = "``a\\nb``";
+        assert_eq!(unescape_escapes(double), double);
+        // But escapes before and after the span still unescape.
+        assert_eq!(unescape_escapes("\\n`a\\nb`\\n"), "\n`a\\nb`\n");
     }
 
     #[test]
