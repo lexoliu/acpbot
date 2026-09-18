@@ -310,3 +310,17 @@ pub enum AgentError {
     #[error("{0}")]
     Other(String),
 }
+
+/// A watch operation failed (`watch`, `list_watches`, `cancel_watch`).
+#[derive(Debug, thiserror::Error)]
+pub enum WatchError {
+    /// The command was empty or whitespace.
+    #[error("watch needs a non-empty `command`")]
+    EmptyCommand,
+    /// `cancel_watch` named a watch that doesn't exist.
+    #[error("unknown watch {0:?} — list_watches shows the live ones")]
+    Unknown(String),
+    /// The daemon is shutting down; new watches can't be registered.
+    #[error("the daemon is shutting down")]
+    ShuttingDown,
+}

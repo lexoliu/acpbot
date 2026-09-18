@@ -162,13 +162,43 @@ pub struct EventReaction {
     pub removed: Vec<String>,
 }
 
+/// What a `watch` event reports (`type == "watch"`): one line of stdout
+/// from the watched command, or the command's end. Every event carries
+/// `status`; `line`/`seq` ride on firings, `exit_code`/`stderr_tail` on
+/// endings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventWatch {
+    /// The watch's id, returned by the `watch` tool.
+    pub id: String,
+    /// The note the agent attached when it created the watch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// `fired` (a stdout line arrived), `exited` (the command finished),
+    /// `failed` (non-zero exit or spawn error), or `cancelled`.
+    pub status: String,
+    /// The stdout line, for `status == "fired"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<String>,
+    /// 1-based firing number, for `status == "fired"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
+    /// The process exit code, for `status == "exited"`/`"failed"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// The last bytes of stderr (trimmed, ≤ 2 KiB), when the command
+    /// failed or complained.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stderr_tail: Option<String>,
+}
+
 /// One chat event, serialized to JSON and handed to the agent as the prompt.
 ///
 /// The schema is the agent's whole view of every chat: it is documented
 /// again in the shared `AGENTS.md` so the two never drift.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatEvent {
-    /// `message`, `command`, `button`, `reaction`, `edited`, or `nudge`
+    /// `message`, `command`, `button`, `reaction`, `edited`, `watch`
+    /// (a watched bash command fired or ended), or `nudge`
     /// (the daemon's silence interrupt — the only kind that isn't a real
     /// platform event).
     #[serde(rename = "type")]
@@ -220,6 +250,10 @@ pub struct ChatEvent {
     /// message reacted to.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reaction: Option<EventReaction>,
+    /// Watch details for `type == "watch"` (see [`EventWatch`]) — a line
+    /// of the watched command's stdout, or its end.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub watch: Option<EventWatch>,
     /// Daemon-fetched previews of links in `text` (see
     /// [`EventLinkPreview`]); absent when the message has no links or
     /// `[preview] enabled = false`.
@@ -322,6 +356,7 @@ mod tests {
             }),
             media: None,
             reaction: None,
+            watch: None,
             link_previews: Vec::new(),
             thread_id: None,
         };
@@ -404,6 +439,7 @@ mod tests {
             sticker: None,
             media: None,
             reaction: None,
+            watch: None,
             link_previews: Vec::new(),
             thread_id: Some(12),
         };
@@ -438,6 +474,7 @@ mod tests {
             sticker: None,
             media: None,
             reaction: None,
+            watch: None,
             link_previews: Vec::new(),
             thread_id: None,
         };

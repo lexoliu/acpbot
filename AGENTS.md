@@ -104,6 +104,15 @@ must do the same (see `ensure_executor` in test modules).
   embed). Per-link timeout + concurrency, a short TTL cache, and a
   loopback/private-host short-circuit since fetches run on the host
   network.
+- `watch.rs` — durable bash watches (`watch`/`list_watches`/`cancel_watch`
+  tools): each watch is a `bash -c` command in its own process group whose
+  stdout lines become `watch` events on the ordinary dispatcher channel
+  (journal, IM history, replay included); the command's end emits one
+  final `exited`/`failed`/`cancelled` event. Definitions persist in
+  `watchers.json` and are re-run at daemon start — durability is the
+  *command* being replayed, so absolute-time shell idioms resume
+  correctly. `cancel` kills the process group; daemon shutdown kills
+  quietly and leaves defs on disk.
 
 ## Conventions
 
