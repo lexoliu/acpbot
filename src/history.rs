@@ -122,6 +122,21 @@ impl History {
         hits
     }
 
+    /// Newest `limit` outbound (`"dir": "out"`) records, chronological
+    /// order — what the continuity inject folds into the bootstrap
+    /// prompt so a resumed incarnation sees which sends already landed.
+    pub fn tail_outbound(&self, limit: usize) -> Vec<Value> {
+        let mut hits: Vec<Value> = self
+            .read_all()
+            .into_iter()
+            .filter(|r| r["dir"] == "out")
+            .collect();
+        if hits.len() > limit {
+            hits.drain(..hits.len() - limit);
+        }
+        hits
+    }
+
     /// Like [`Self::tail`], but only records whose `text`, `from.name` or
     /// `command` fields contain `query` (case-insensitive).
     pub fn search(
@@ -263,5 +278,31 @@ mod tests {
             expected
         );
         assert!(parse_time_arg("soon", now).is_err());
+    }
+
+    #[test]
+    fn tail_outbound_filters_dir() {
+        let dir = std::env::temp_dir().join(format!("acpbot-hist-out-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.jsonl");
+        let _ = std::fs::remove_file(&path);
+        let history = History::open(&path);
+
+        history.append(&json!({"ts": 100, "dir": "in", "type": "message", "text": "hi"}));
+        history.append(&json!({"ts": 200, "dir": "out", "type": "message", "text": "first"}));
+        history.append(&json!({"ts": 300, "dir": "in", "type": "message", "text": "again"}));
+        history.append(&json!({"ts": 400, "dir": "out", "type": "message", "text": "second"}));
+        history.append(&json!({"ts": 500, "dir": "out", "type": "sticker", "emoji": "😁"}));
+
+        let all = history.tail_outbound(10);
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0]["text"], json!("first")); // chronological
+        assert!(all.iter().all(|r| r["dir"] == "out"));
+
+        let last = history.tail_outbound(2);
+        assert_eq!(last.len(), 2);
+        assert_eq!(last[0]["text"], json!("second")); // newest kept
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
