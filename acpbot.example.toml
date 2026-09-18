@@ -101,6 +101,9 @@ kind = "native"
 # command = "~/.cargo/bin/acpsub"
 # args = ["serve"]
 # env = {}                      # optional extra environment
+# note = "subagent server — spawn with agent=\"gemini\" for image \
+#   generation and video/audio analysis; agent=\"devin\" (the default) \
+#   for general work"  # shown to the agent in AGENTS.md
 # Requires, for the acpsub+agy backends:
 # [agent.isolation]
 # state_dirs = ["~/.devin", "~/.config/devin", "~/.config/acpsub", "~/.local/share/acpsub"]

@@ -1952,14 +1952,18 @@ fn managed_block(shared: &AgentShared) -> String {
             .agent
             .mcp_servers
             .iter()
-            .map(|server| format!("`{}`", server.name))
+            .map(|server| match &server.note {
+                Some(note) => format!("`{}` — {note}", server.name),
+                None => format!("`{}`", server.name),
+            })
             .collect::<Vec<_>>()
             .join(", ");
         format!(
-            "\n\nExtra MCP servers beyond `chat` are configured: {names} — \
-             their tools appear under `mcp__<name>__*` (list them with \
-             `mcp_list_tools`). A subagent server such as `acpsub` is how \
-             you spawn background subagents with the full tool set."
+            "\n\nExtra MCP servers beyond `chat` are configured — their \
+             tools appear under `mcp__<name>__*` (list them with \
+             `mcp_list_tools`): {names}. A subagent server such as \
+             `acpsub` is how you spawn background subagents with the full \
+             tool set."
         )
     };
     format!(
@@ -2923,6 +2927,7 @@ pub(super) mod tests {
                     env: [("AGY_BIN".to_string(), "/opt/agy".to_string())]
                         .into_iter()
                         .collect(),
+                    note: Some("gemini backend generates images".to_string()),
                 }],
                 ..AgentConfig::default()
             },
@@ -2952,7 +2957,7 @@ pub(super) mod tests {
         assert_eq!(config["mcpServers"]["acpsub"]["env"]["AGY_BIN"], "/opt/agy");
 
         let agents_md = std::fs::read_to_string(cwd.join("AGENTS.md")).unwrap();
-        assert!(agents_md.contains("`acpsub`"));
+        assert!(agents_md.contains("`acpsub` — gemini backend generates images"));
     }
 
     /// Full pipeline without Telegram: event → ACP prompt → `devin acp`
