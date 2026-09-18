@@ -233,6 +233,29 @@ pub struct AgentConfig {
     /// past this the call is presumed dead). `0` waits forever.
     #[serde(default = "default_tool_silence_secs")]
     pub tool_silence_secs: u64,
+    /// Extra MCP servers merged into the session's `.devin/mcp_config.json`
+    /// next to the built-in `chat` entry — `acpsub serve`, for example,
+    /// gives the agent spawnable subagents. The agent spawns them inside
+    /// its sandbox, so use an absolute `command` path and grant the binary
+    /// plus its state directories through `[agent.isolation]`.
+    #[serde(default)]
+    pub mcp_servers: Vec<McpServerSpec>,
+}
+
+/// One extra MCP server entry for the session's `.devin/mcp_config.json`.
+#[derive(Debug, Deserialize)]
+pub struct McpServerSpec {
+    /// Server name — tools appear as `mcp__<name>__*`.
+    pub name: String,
+    /// Program the agent spawns (tilde-expanded; use an absolute path
+    /// under sandboxed isolation, where PATH is minimal).
+    pub command: String,
+    /// Arguments for the program.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Extra environment for the server process.
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
 }
 
 /// How the agent process is isolated from the host.
@@ -416,6 +439,7 @@ impl Default for AgentConfig {
             idle_compact_secs: default_idle_compact_secs(),
             nudge_after_secs: default_nudge_after_secs(),
             tool_silence_secs: default_tool_silence_secs(),
+            mcp_servers: Vec::new(),
         }
     }
 }
@@ -588,6 +612,11 @@ impl Config {
             {
                 expand_tilde(path);
             }
+        }
+        for server in &mut config.agent.mcp_servers {
+            let mut command = PathBuf::from(&server.command);
+            expand_tilde(&mut command);
+            server.command = command.to_string_lossy().into_owned();
         }
         Ok(config)
     }

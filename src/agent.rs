@@ -1878,14 +1878,22 @@ fn prepare_chat_dir(
     // the directory visibly exists before the agent goes looking.
     std::fs::create_dir_all(cwd.join(".devin/skills"))?;
 
-    let mcp_config = serde_json::json!({
-        "mcpServers": {
-            "chat": {
-                "command": mcp_command,
-                "args": mcp_args,
-            }
+    let mut servers = serde_json::Map::new();
+    servers.insert(
+        "chat".to_string(),
+        serde_json::json!({"command": mcp_command, "args": mcp_args}),
+    );
+    for server in &shared.agent.mcp_servers {
+        let mut entry = serde_json::json!({
+            "command": server.command,
+            "args": server.args,
+        });
+        if !server.env.is_empty() {
+            entry["env"] = serde_json::json!(server.env);
         }
-    });
+        servers.insert(server.name.clone(), entry);
+    }
+    let mcp_config = serde_json::json!({ "mcpServers": servers });
     std::fs::write(
         cwd.join(".devin/mcp_config.json"),
         serde_json::to_string_pretty(&mcp_config)?,
@@ -1937,9 +1945,26 @@ fn splice_managed(existing: &str, managed: &str) -> String {
 /// The daemon-owned block: persona, protocol, and self-evolution rules.
 fn managed_block(shared: &AgentShared) -> String {
     let persona = shared.persona.as_deref().unwrap_or(DEFAULT_PERSONA);
+    let extra_servers = if shared.agent.mcp_servers.is_empty() {
+        String::new()
+    } else {
+        let names = shared
+            .agent
+            .mcp_servers
+            .iter()
+            .map(|server| format!("`{}`", server.name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "\n\nExtra MCP servers beyond `chat` are configured: {names} — \
+             their tools appear under `mcp__<name>__*` (list them with \
+             `mcp_list_tools`). A subagent server such as `acpsub` is how \
+             you spawn background subagents with the full tool set."
+        )
+    };
     format!(
         "{MANAGED_START}\n\
-         {persona}\n\n{PROTOCOL_DOC}\n\n# Evolving yourself\n\n\
+         {persona}\n\n{PROTOCOL_DOC}{extra_servers}\n\n# Evolving yourself\n\n\
          You own your configuration — improve it when you learn something \
          worth keeping:\n\n\
          - **AGENTS.md**: everything below the `acpbot:managed` markers is \
@@ -2880,6 +2905,54 @@ pub(super) mod tests {
         let spliced = std::fs::read_to_string(&path).unwrap();
         assert!(spliced.contains(MANAGED_START));
         assert!(spliced.contains("# my own rules"));
+    }
+
+    /// `[[agent.mcp_servers]]` entries land in `.devin/mcp_config.json`
+    /// next to `chat`, and the managed block names them for the model.
+    #[test]
+    fn extra_mcp_servers_reach_the_agent() {
+        let dir = std::env::temp_dir().join(format!("acpbot-mcpextra-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cwd = dir.join("chat");
+        let shared = AgentShared {
+            agent: AgentConfig {
+                mcp_servers: vec![crate::config::McpServerSpec {
+                    name: "acpsub".to_string(),
+                    command: "/opt/acpsub".to_string(),
+                    args: vec!["serve".to_string()],
+                    env: [("AGY_BIN".to_string(), "/opt/agy".to_string())]
+                        .into_iter()
+                        .collect(),
+                }],
+                ..AgentConfig::default()
+            },
+            bridge_bin: PathBuf::from("/nonexistent/acpbot"),
+            data_dir: dir.clone(),
+            sticker_dir: dir.join("stickers"),
+            persona: None,
+            sticker_library: Arc::new(crate::stickerlib::StickerLibrary::load(&dir, None).unwrap()),
+            sender_for: Box::new(|_, _, _, _| Err(SenderError::Other("unused".to_string()))),
+            session_updates: async_channel::unbounded().0,
+            previewer: None,
+            watchers: Arc::new(crate::watch::Watchers::new(
+                &dir,
+                async_channel::unbounded().0,
+                "telegram",
+            )),
+        };
+        prepare_chat_dir(&cwd, "acpbot", &["mcp-bridge".to_string()], &shared).unwrap();
+
+        let config: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(cwd.join(".devin/mcp_config.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(config["mcpServers"]["chat"]["command"], "acpbot");
+        assert_eq!(config["mcpServers"]["acpsub"]["command"], "/opt/acpsub");
+        assert_eq!(config["mcpServers"]["acpsub"]["args"][0], "serve");
+        assert_eq!(config["mcpServers"]["acpsub"]["env"]["AGY_BIN"], "/opt/agy");
+
+        let agents_md = std::fs::read_to_string(cwd.join("AGENTS.md")).unwrap();
+        assert!(agents_md.contains("`acpsub`"));
     }
 
     /// Full pipeline without Telegram: event → ACP prompt → `devin acp`
