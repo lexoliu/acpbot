@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use aither_acp::{
-    ClientHandler, RequestPermissionOutcome, RequestPermissionParams, RequestPermissionResult,
-    SessionNotification, SessionUpdate, ToolCallStatus, ToolKind,
+    ClientHandler, PermissionOptionKind, RequestPermissionOutcome, RequestPermissionParams,
+    RequestPermissionResult, SessionNotification, SessionUpdate, ToolCallStatus, ToolKind,
 };
 use aither_mcp::protocol::JsonRpcError;
 use async_channel::Sender as ChanSender;
@@ -30,6 +30,15 @@ use tracing::{debug, warn};
 /// whose tool calls run in their own conversations and never surface here.
 pub(crate) const MAIN_BLOCKED_TOOLS: &[&str] =
     &["run_command", "send_command_input", "command_status"];
+
+/// Whether a tool call is command execution — `kind == Execute` for a
+/// spec-conformant harness, else the name list for ones that leave
+/// `kind` unset. Used by both enforcement paths: the `ToolCall`
+/// notification flag (cancel + re-prompt) and `request_permission`
+/// (graceful deny).
+fn is_command_tool(kind: Option<ToolKind>, title: &str) -> bool {
+    kind == Some(ToolKind::Execute) || MAIN_BLOCKED_TOOLS.contains(&title)
+}
 
 /// What the turn watchdog knows about the live session: *any* update is
 /// activity (thinking, streaming, tool progress — only a truly mute turn
@@ -196,8 +205,7 @@ impl ClientHandler for BotClientHandler {
                 call.status,
                 Some(ToolCallStatus::Completed | ToolCallStatus::Failed)
             )
-            && (call.kind == Some(ToolKind::Execute)
-                || MAIN_BLOCKED_TOOLS.contains(&call.title.as_str()))
+            && is_command_tool(call.kind, &call.title)
         {
             let _ = self.blocked_tool.try_send(call.title.clone());
         }
@@ -225,8 +233,36 @@ impl ClientHandler for BotClientHandler {
         &self,
         params: RequestPermissionParams,
     ) -> Result<RequestPermissionResult, JsonRpcError> {
-        // Sessions run in bypass mode, so this is a last-resort path: pick the
-        // most permissive-looking option rather than cancelling the turn.
+        let call = &params.tool_call;
+        // Command execution on the shared thread is denied in-band — the
+        // model gets a refused tool call inside the same turn and can
+        // delegate instead of losing the turn to a cancel. Only reachable
+        // when the session mode routes decisions here (a bypass-mode
+        // harness resolves permissions internally and never asks).
+        if is_command_tool(call.kind, &call.title) {
+            warn!(tool = %call.title, "denying command tool on the shared thread");
+            let outcome = params
+                .options
+                .iter()
+                .find(|o| o.kind == PermissionOptionKind::RejectAlways)
+                .or_else(|| {
+                    params
+                        .options
+                        .iter()
+                        .find(|o| o.kind == PermissionOptionKind::RejectOnce)
+                })
+                .map_or(RequestPermissionOutcome::Cancelled, |o| {
+                    RequestPermissionOutcome::Selected {
+                        option_id: o.option_id.clone(),
+                    }
+                });
+            return Ok(RequestPermissionResult {
+                outcome,
+                meta: None,
+            });
+        }
+        // Everything else: pick the most permissive-looking option rather
+        // than cancelling the turn.
         let option_id = params
             .options
             .iter()
@@ -355,6 +391,72 @@ mod tests {
             Some(ToolCallStatus::InProgress),
         )));
         assert_eq!(rx.try_recv().as_deref(), Ok("send_command_input"));
+    }
+
+    /// `request_permission` refuses command tools in-band and allows the
+    /// rest — the graceful half of the shared-thread enforcement.
+    #[test]
+    fn permission_denies_commands_allows_the_rest() {
+        use aither_acp::{PermissionOption, ToolCall};
+        let (tx, _rx) = async_channel::unbounded::<String>();
+        let handler = BotClientHandler::new(
+            PathBuf::from("/tmp/acpbot-test-transcript.log"),
+            Arc::new(AtomicBool::new(false)),
+            tx,
+            Arc::new(Activity::default()),
+        );
+        let option = |id: &str, kind| PermissionOption {
+            option_id: id.to_string(),
+            name: id.to_string(),
+            kind,
+            meta: None,
+        };
+        let params = |title: &str, kind: Option<ToolKind>| RequestPermissionParams {
+            session_id: "s".to_string(),
+            tool_call: ToolCall {
+                tool_call_id: "1".to_string(),
+                title: title.to_string(),
+                kind,
+                status: None,
+                content: Vec::new(),
+                locations: Vec::new(),
+                raw_input: None,
+                raw_output: None,
+                meta: None,
+            },
+            options: vec![
+                option("allow_once", PermissionOptionKind::AllowOnce),
+                option("reject_once", PermissionOptionKind::RejectOnce),
+            ],
+            meta: None,
+        };
+
+        // Command-shaped calls are rejected via the reject option when
+        // one is offered…
+        let denied =
+            block_on(handler.request_permission(params("exec", Some(ToolKind::Execute)))).unwrap();
+        assert_eq!(
+            denied.outcome,
+            RequestPermissionOutcome::Selected {
+                option_id: "reject_once".to_string()
+            }
+        );
+        // …and cancelled outright when the request carries no reject.
+        let mut no_reject = params("run_command", None);
+        no_reject.options = vec![option("allow_once", PermissionOptionKind::AllowOnce)];
+        let denied = block_on(handler.request_permission(no_reject)).unwrap();
+        assert_eq!(denied.outcome, RequestPermissionOutcome::Cancelled);
+
+        // Anything else gets the permissive option.
+        let allowed =
+            block_on(handler.request_permission(params("view_file", Some(ToolKind::Read))))
+                .unwrap();
+        assert_eq!(
+            allowed.outcome,
+            RequestPermissionOutcome::Selected {
+                option_id: "allow_once".to_string()
+            }
+        );
     }
 
     /// Every update is activity, and in-flight tool calls make the turn

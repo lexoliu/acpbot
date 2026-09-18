@@ -149,12 +149,16 @@ every chat waits. Keep the main turn short — ack, hand the task to a
 background subagent, end the turn; relay the result to the asking chat when
 the subagent reports back. Tooling, prompts, and the managed `AGENTS.md`
 block (`PROTOCOL_DOC` in `agent.rs`) all tune toward that: work happens in
-subagents, the main turn only talks and dispatches. It is also enforced —
-`BotClientHandler` flags any tool call with `kind: Execute` the moment one
-starts on the shared thread — the agy bridge classifies `run_command` &
-friends, devin's `exec` reports it natively, and a `MAIN_BLOCKED_TOOLS`
-name list covers harnesses that leave `kind` unset. (Subagent calls run in
-their own conversations and never surface here.) The turn is cancelled and
+subagents, the main turn only talks and dispatches. It is enforced two
+ways — `request_permission` denies any command-shaped call in-band when
+the session mode routes decisions to the client (the model sees a refused
+call inside the same turn and can delegate), and as a backstop for modes
+like `bypass` that resolve permissions internally, `BotClientHandler`
+flags any tool call with `kind: Execute` the moment one starts on the
+shared thread — the agy bridge classifies `run_command` & friends,
+devin's `exec` reports it natively, and a `MAIN_BLOCKED_TOOLS` name list
+covers harnesses that leave `kind` unset. (Subagent calls run in their own
+conversations and never surface here.) The turn is then cancelled and
 re-prompted as a `nudge`, bounded by the same retry budget as the
 silent-turn recovery.
 
