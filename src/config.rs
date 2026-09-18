@@ -256,6 +256,10 @@ pub struct McpServerSpec {
     /// Extra environment for the server process.
     #[serde(default)]
     pub env: std::collections::BTreeMap<String, String>,
+    /// What this server is for, surfaced to the agent in AGENTS.md —
+    /// e.g. which subagent backends it offers and what each can do.
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 /// How the agent process is isolated from the host.
