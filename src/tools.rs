@@ -131,8 +131,26 @@ pub fn chat_tools(router: Arc<ChatRouter>, restart: ChanSender<()>) -> Tools {
             router: router.clone(),
         },
     );
-    register(&mut tools, SearchHistory { router });
+    register(
+        &mut tools,
+        SearchHistory {
+            router: router.clone(),
+        },
+    );
     register(&mut tools, Restart { restart });
+    register(
+        &mut tools,
+        Watch {
+            router: router.clone(),
+        },
+    );
+    register(
+        &mut tools,
+        ListWatches {
+            router: router.clone(),
+        },
+    );
+    register(&mut tools, CancelWatch { router });
     tools
 }
 
@@ -1239,6 +1257,140 @@ impl Tool for SearchHistory {
     }
 }
 
+/// Run a bash command whose output wakes the agent — the scheduled
+/// wake-up primitive. Every stdout line becomes a `watch` event; the
+/// command's end becomes one final event.
+struct Watch {
+    router: Arc<ChatRouter>,
+}
+
+/// Arguments for `watch`.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct WatchArgs {
+    /// The bash command, run via `bash -c`. Each line it prints wakes
+    /// you with a `watch` event (`status: "fired"`); when it ends you
+    /// get one last event (`exited`/`failed`/`cancelled`). Write the
+    /// timing in bash — `sleep 1800` fires once in 30 minutes,
+    /// `until curl -sf URL; do sleep 60; done && echo up` polls,
+    /// `while :; do sleep 86400; echo tick; done` repeats. Anchor to
+    /// absolute times (`sleep $((T - $(date +%s)))`) so a daemon
+    /// restart re-running the command resumes correctly.
+    command: String,
+    /// A short note on what this is for — echoed back on every event so
+    /// future-you has the context (e.g. "poll PR #42 CI, tell lexo").
+    note: Option<String>,
+    /// Target chat the events route to — same convention as
+    /// `send_message`'s `chat`. Omit for the current chat.
+    chat: Option<String>,
+}
+
+impl Tool for Watch {
+    type Arguments = WatchArgs;
+    type Res = ToolResult;
+
+    fn name(&self) -> std::borrow::Cow<'static, str> {
+        "watch".into()
+    }
+
+    fn description(&self) -> std::borrow::Cow<'static, str> {
+        "Run a bash command in the background whose output wakes you: each \
+         stdout line arrives as a `watch` event in the target chat, and the \
+         command's end sends one final `exited`/`failed` event. This is how \
+         you schedule yourself — reminders, polls, recurring checks — the \
+         timing lives in the command (`sleep`, `until`, `while`), and \
+         watchers persist across daemon restarts by re-running the command, \
+         so write it idempotent and prefer absolute times. Use `list_watches` \
+         and `cancel_watch` to manage live ones."
+            .into()
+    }
+
+    async fn call(&self, args: Self::Arguments) -> aither_core::Result<Self::Res> {
+        let key = match self.router.resolve(args.chat.as_deref()) {
+            Ok(key) => key,
+            Err(msg) => return Ok(ToolResult::error(msg)),
+        };
+        let thread = self.router.thread(&key);
+        match self.router.shared().watchers.add(
+            args.command,
+            args.note,
+            key.id,
+            (thread != 0).then_some(thread),
+        ) {
+            Ok(id) => Ok(ToolResult::text(format!(
+                "watch {id} registered — its output will arrive as `watch` events"
+            ))),
+            Err(error) => Ok(ToolResult::error(error.to_string())),
+        }
+    }
+}
+
+/// The live watches — `list_watches` reports definitions plus pids.
+struct ListWatches {
+    router: Arc<ChatRouter>,
+}
+
+/// Arguments for `list_watches`.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ListWatchesArgs {}
+
+impl Tool for ListWatches {
+    type Arguments = ListWatchesArgs;
+    type Res = ToolResult;
+
+    fn name(&self) -> std::borrow::Cow<'static, str> {
+        "list_watches".into()
+    }
+
+    fn description(&self) -> std::borrow::Cow<'static, str> {
+        "List your registered watches: id, the bash command, the note, the \
+         chat its events route to, and the live pid. These survive daemon \
+         restarts — anything still relevant is re-run."
+            .into()
+    }
+
+    async fn call(&self, _args: Self::Arguments) -> aither_core::Result<Self::Res> {
+        let watches = self.router.shared().watchers.list();
+        Ok(ToolResult::text(
+            serde_json::to_string(&watches).expect("watches serialize"),
+        ))
+    }
+}
+
+/// Kill a watch and drop its definition.
+struct CancelWatch {
+    router: Arc<ChatRouter>,
+}
+
+/// Arguments for `cancel_watch`.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct CancelWatchArgs {
+    /// The watch id — `w_…`, from `watch` or `list_watches`.
+    id: String,
+}
+
+impl Tool for CancelWatch {
+    type Arguments = CancelWatchArgs;
+    type Res = ToolResult;
+
+    fn name(&self) -> std::borrow::Cow<'static, str> {
+        "cancel_watch".into()
+    }
+
+    fn description(&self) -> std::borrow::Cow<'static, str> {
+        "Cancel a watch: kills its process group and removes it from the \
+         registry, so it won't run again after a restart either. You get a \
+         `cancelled` event as confirmation."
+            .into()
+    }
+
+    async fn call(&self, args: Self::Arguments) -> aither_core::Result<Self::Res> {
+        match self.router.shared().watchers.cancel(&args.id) {
+            Ok(()) => Ok(ToolResult::text(format!("watch {} cancelled", args.id))),
+            Err(error) => Ok(ToolResult::error(error.to_string())),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1375,6 +1527,7 @@ mod tests {
         assert_eq!(
             names,
             [
+                "cancel_watch",
                 "chat_info",
                 "delete_message",
                 "edit_message",
@@ -1384,6 +1537,7 @@ mod tests {
                 "list_chats",
                 "list_sticker_sets",
                 "list_stickers",
+                "list_watches",
                 "message_status",
                 "pin_message",
                 "react",
@@ -1394,8 +1548,64 @@ mod tests {
                 "send_file",
                 "send_message",
                 "send_sticker",
+                "watch",
             ]
         );
+    }
+
+    /// `watch`/`list_watches`/`cancel_watch` drive the durable registry —
+    /// a registered watch lists with a pid and cancels cleanly.
+    #[test]
+    fn watch_tools_register_list_and_cancel() {
+        ensure_executor();
+        let dir = tempdir("watch");
+        let (tools, _router, _out, _keys, _restart, _history) = fixture(&dir);
+        let block = |name, args| futures_lite::future::block_on(tools.call(name, args)).unwrap();
+
+        let created = block(
+            "watch",
+            "{\"command\":\"sleep 60\",\"note\":\"test wake\",\"chat\":\"0\"}",
+        );
+        let created = created.as_text().unwrap().to_string();
+        let id = created
+            .split_whitespace()
+            .nth(1)
+            .expect("watch id in result")
+            .to_string();
+        assert!(id.starts_with("w_"), "{created}");
+
+        let listed = block("list_watches", "{}").as_text().unwrap().to_string();
+        assert!(listed.contains("sleep 60"), "{listed}");
+        assert!(listed.contains("test wake"), "{listed}");
+
+        let cancel_args = format!("{{\"id\":\"{id}\"}}");
+        let cancelled = block("cancel_watch", &cancel_args);
+        assert!(cancelled.as_text().unwrap().contains("cancelled"));
+
+        let gone = block("list_watches", "{}").as_text().unwrap().to_string();
+        assert!(!gone.contains("sleep 60"), "{gone}");
+        // A never-registered id is deterministic; re-cancelling the same
+        // id races with the task's own cleanup, so it isn't asserted.
+        let unknown = block("cancel_watch", "{\"id\":\"w_000000000000\"}");
+        assert!(unknown.as_text().unwrap().contains("unknown watch"));
+    }
+
+    /// `executor_core::spawn` (watch tasks) needs a global executor —
+    /// leak one, unless a sibling test already did.
+    fn ensure_executor() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let executor: &'static async_executor::Executor<'static> =
+                Box::leak(Box::new(async_executor::Executor::new()));
+            if executor_core::try_init_global_executor(executor).is_err() {
+                return;
+            }
+            for _ in 0..2 {
+                std::thread::spawn(move || {
+                    futures_lite::future::block_on(executor.run(std::future::pending::<()>()));
+                });
+            }
+        });
     }
 
     /// `history`/`search_history` read the IM record the sender writes —

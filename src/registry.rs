@@ -220,6 +220,7 @@ mod tests {
             sticker: None,
             media: None,
             reaction: None,
+            watch: None,
             link_previews: Vec::new(),
             thread_id: None,
         }

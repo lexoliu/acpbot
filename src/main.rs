@@ -26,6 +26,7 @@ mod stickerlib;
 mod stickers;
 mod stickerset;
 mod tools;
+mod watch;
 
 use std::path::{Path, PathBuf};
 
@@ -208,6 +209,14 @@ fn run(config_path: &Path) -> Result<(), MainError> {
         telegram_client,
     )?);
 
+    // Bash-backed watches feed the same event channel the platforms do;
+    // the dispatcher replays `watchers.json` when it starts.
+    let watchers = std::sync::Arc::new(crate::watch::Watchers::new(
+        &config.paths.data_dir,
+        events_tx.clone(),
+        config.platform.name(),
+    ));
+
     let dispatcher = Dispatcher::new(
         config.agent,
         std::env::current_exe()?,
@@ -218,6 +227,7 @@ fn run(config_path: &Path) -> Result<(), MainError> {
         sticker_library,
         config.browser,
         config.preview,
+        watchers.clone(),
         config.platform.name(),
     );
     // Kept, not detached: on shutdown the dispatcher's drop chain is what
@@ -229,8 +239,11 @@ fn run(config_path: &Path) -> Result<(), MainError> {
     info!("polling for events");
     futures_lite::future::block_on(executor.run(bot_run)).map_err(MainError::Bot)?;
 
-    // The bot is stopped; closing the last event sender ends the dispatcher,
-    // which waits for the shared actor (and its sandbox) to finish.
+    // The bot is stopped; kill the watches quietly (their defs persist
+    // for the next run) and close the last event sender, which ends the
+    // dispatcher — it waits for the shared actor (and its sandbox) to
+    // finish.
+    watchers.shutdown();
     drop(events_tx);
     info!("shutting down agent");
     futures_lite::future::block_on(executor.run(dispatcher_task));

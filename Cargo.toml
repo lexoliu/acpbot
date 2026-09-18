@@ -48,3 +48,8 @@ linkify = "0.11.0"
 tl = "0.7.8"
 html-escape = "0.2.15"
 url = "2.5.8"
+
+[target.'cfg(unix)'.dependencies]
+# Process-group kill for `cancel_watch` — children spawn in their own
+# group so `kill(-pgid)` reaches the whole command tree.
+libc = "0.2"

@@ -79,6 +79,9 @@ pub struct AgentShared {
     /// Fetches `link_previews` for links in inbound message text at
     /// prompt-assembly time (`[preview]`); `None` when disabled.
     pub previewer: Option<crate::preview::Previewer>,
+    /// The durable bash watches (`watch`/`list_watches`/`cancel_watch`
+    /// tools); each stdout line lands back here as a `watch` event.
+    pub watchers: Arc<crate::watch::Watchers>,
 }
 
 /// What the actor tells the dispatcher about the live session.
@@ -251,6 +254,18 @@ impl ChatRouter {
         self.state.lock().expect("chat router").current = Some(key);
     }
 
+    /// The forum topic `key`'s latest events arrived in (`0` = none) —
+    /// watches created inside a topic keep their events there.
+    pub fn thread(&self, key: &ChatKey) -> i64 {
+        self.state
+            .lock()
+            .expect("chat router")
+            .threads
+            .get(key)
+            .map(|cell| cell.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
     /// Record the forum topic `key`'s current events arrived in (`0` =
     /// none). The cell outlives any one sender, so this also reaches
     /// senders built later.
@@ -388,6 +403,7 @@ impl Dispatcher {
         sticker_library: Arc<crate::stickerlib::StickerLibrary>,
         browser: crate::config::BrowserConfig,
         preview: crate::config::PreviewConfig,
+        watchers: Arc<crate::watch::Watchers>,
         platform: &'static str,
     ) -> Self {
         let (session_updates, session_ids) = async_channel::unbounded();
@@ -406,6 +422,7 @@ impl Dispatcher {
                 previewer: preview
                     .enabled
                     .then(|| crate::preview::Previewer::new(&preview)),
+                watchers,
             }),
             platform,
             browser: browser
@@ -420,6 +437,9 @@ impl Dispatcher {
 
     /// Consume events forever, forwarding each to the shared actor.
     pub async fn run(mut self, events: Receiver<ChatEvent>) {
+        // Watches outlive the daemon by definition — re-run every persisted
+        // command before anything else so their wake-ups start flowing.
+        self.shared.watchers.restore();
         // Warm the agent now — process spawn, the ACP handshake, and the
         // continuity inject are all paid before the first event so that
         // event's turn is just the model. Events arriving during warm-up
@@ -1970,6 +1990,19 @@ Chats the bot isn't in cannot answer — ask the user to add the bot. \
 - `restart` `{}` — reincarnate your process after editing AGENTS.md or \
 adding skills. The next spawn is a FRESH session: anything the next you \
 must remember goes in AGENTS.md or CONTINUITY.md before you call it. \
+- `watch` `{command, note?, chat?}` — your scheduled wake-up: the daemon \
+runs the bash command and every stdout line arrives back here as a \
+`watch` event in the target chat; the command's end sends a final \
+`exited`/`failed`/`cancelled` event. The timing lives in bash, not in \
+the tool — `sleep 1800` wakes you once in 30 minutes, `sleep $((T - \
+$(date +%s)))` sleeps until absolute time T (a daemon restart re-runs \
+your command, so absolute times resume correctly where relative ones \
+restart from zero), `until curl -sf URL; do sleep 60; done && echo up` \
+polls a condition, `while :; do sleep 86400; echo tick; done` recurs. \
+Attach a `note` saying what it's for — every event echoes it back, \
+which is the only context a wake carries. \
+- `list_watches` `{}` / `cancel_watch` `{id}` — inspect and kill your \
+live watches. \
 - `browser_*` — the daemon hosts a shared browser (real Chrome driven \
 over CDP with no automation flags — it reads as a human's browser) on \
 this same `chat` server: `browser_navigate`, `browser_snapshot` \
@@ -2086,7 +2119,7 @@ events arrive together):
 \"text\": \"hello\"}}
 ```
 
-`type` is `message`, `command`, `button`, `reaction`, `edited`, \
+`type` is `message`, `command`, `button`, `reaction`, `edited`, `watch`, \
 or `nudge`. `ts` is the event's epoch-seconds timestamp (the platform's \
 message/edit/reaction time). `attention` is `direct` or `ambient` — see \
 the group rule above. `command` events \
@@ -2100,6 +2133,12 @@ the chat is a forum; your sends follow the current topic automatically. \
 A `nudge` event is the daemon interrupting a silent turn — or re-prompting \
 one that ended without a single chat tool call; its `note` says which. \
 See the ten-second rule above. \
+A `watch` event is one of your bash watchers reporting: `watch.status` is \
+`fired` (a stdout line — `watch.line`, `watch.seq`), `exited`, `failed` \
+(`watch.exit_code`, `watch.stderr_tail` say how it ended), or `cancelled`; \
+`watch.id`/`watch.note` name the watch and why you set it. A wake with no \
+clear remaining job usually wants a reply in its `chat`, a `cancel_watch`, \
+or nothing — read `history` if the context is gone. \
 When `text` carries links, `link_previews` holds the daemon's prefetch of \
 each: `title`/`site`/`text` (a `t.me/<channel>/<post>` link's `text` is \
 the post's own body), or `error` when the page couldn't be previewed. \
@@ -2253,6 +2292,7 @@ pub(super) mod tests {
             sticker: None,
             media: None,
             reaction: None,
+            watch: None,
             link_previews: Vec::new(),
             thread_id: None,
         }
@@ -2419,6 +2459,11 @@ pub(super) mod tests {
                 enabled: false,
                 ..Default::default()
             },
+            Arc::new(crate::watch::Watchers::new(
+                &data_dir,
+                async_channel::unbounded().0,
+                "telegram",
+            )),
             "telegram",
         );
         let (tx, rx) = async_channel::unbounded();
@@ -2524,6 +2569,11 @@ pub(super) mod tests {
             }),
             session_updates: async_channel::unbounded().0,
             previewer: None,
+            watchers: Arc::new(crate::watch::Watchers::new(
+                dir,
+                async_channel::unbounded().0,
+                "telegram",
+            )),
         });
         (
             Arc::new(ChatRouter::new(
@@ -2726,6 +2776,11 @@ pub(super) mod tests {
             sender_for: Box::new(|_, _, _, _| Err(SenderError::Other("unused".to_string()))),
             session_updates: async_channel::unbounded().0,
             previewer: None,
+            watchers: Arc::new(crate::watch::Watchers::new(
+                &dir,
+                async_channel::unbounded().0,
+                "telegram",
+            )),
         };
         let bridge_args = vec!["mcp-bridge".to_string(), "x.sock".to_string()];
         prepare_chat_dir(&cwd, "acpbot", &bridge_args, &shared).unwrap();
