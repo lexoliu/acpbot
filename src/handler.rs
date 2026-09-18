@@ -33,10 +33,11 @@ pub(crate) const MAIN_BLOCKED_TOOLS: &[&str] =
 
 /// What the turn watchdog knows about the live session: *any* update is
 /// activity (thinking, streaming, tool progress — only a truly mute turn
-/// is "silent"), and in-flight tool calls make the turn *busy* — it gets
-/// the generous `tool_silence` budget instead of `nudge_after`, because a
-/// `web_search`/`exec`/subagent working quietly for a minute is normal,
-/// while a silent tool past the budget is genuinely hung.
+/// is "silent"). Three silence budgets apply: `nudge_after` while the
+/// turn has produced no model output at all, `generation_silence` once it
+/// has (thinking between iterations is legitimate quiet), and the
+/// generous `tool_silence` while a tool call is in flight — a silent tool
+/// past the budget is genuinely hung.
 #[derive(Debug, Default)]
 pub(crate) struct Activity {
     /// Epoch ms of the last session notification of any kind.
@@ -44,6 +45,11 @@ pub(crate) struct Activity {
     /// Tool call ids that started and haven't reported a terminal status.
     /// Keyed by id so `pending → in_progress` transitions don't double.
     pub live_tools: Mutex<HashSet<String>>,
+    /// Whether the model has produced output this turn — the watchdog's
+    /// line between a mute start (quick `nudge_after` interrupt) and a
+    /// live turn's quiet gap between iterations (longer
+    /// `generation_silence` budget).
+    pub output_seen: AtomicBool,
 }
 
 impl Activity {
@@ -52,10 +58,31 @@ impl Activity {
         !self.live_tools.lock().expect("activity").is_empty()
     }
 
+    /// Whether the turn has produced any model output — message/thought
+    /// chunks, a plan, tool calls, or metered usage. Bookkeeping (the
+    /// prompt echo, config/mode/commands/info updates) doesn't count.
+    pub fn generating(&self) -> bool {
+        self.output_seen.load(Ordering::Relaxed)
+    }
+
+    /// Updates that prove the model generated something this turn.
+    fn is_model_output(update: &SessionUpdate) -> bool {
+        matches!(
+            update,
+            SessionUpdate::AgentMessageChunk(_)
+                | SessionUpdate::AgentThoughtChunk(_)
+                | SessionUpdate::Plan(_)
+                | SessionUpdate::ToolCall(_)
+                | SessionUpdate::ToolCallUpdate(_)
+                | SessionUpdate::UsageUpdate(_)
+        )
+    }
+
     /// Drop every tracked call — after a cancelled turn the killed calls
     /// may never report terminal statuses.
     pub fn clear_tools(&self) {
         self.live_tools.lock().expect("activity").clear();
+        self.output_seen.store(false, Ordering::Relaxed);
     }
 
     /// A status that ends a tool call's lifecycle.
@@ -126,6 +153,9 @@ impl ClientHandler for BotClientHandler {
         // Tool-call lifecycle for the busy flag. A `user_message_chunk`
         // means a fresh prompt: whatever ran before is dead, whether or
         // not the harness bothered to say so.
+        if Activity::is_model_output(update) {
+            self.activity.output_seen.store(true, Ordering::Relaxed);
+        }
         {
             let mut live = self.activity.live_tools.lock().expect("activity");
             match update {
@@ -135,7 +165,10 @@ impl ClientHandler for BotClientHandler {
                 SessionUpdate::ToolCallUpdate(call) => {
                     Activity::track(&mut live, &call.tool_call_id, call.status);
                 }
-                SessionUpdate::UserMessageChunk(_) => live.clear(),
+                SessionUpdate::UserMessageChunk(_) => {
+                    live.clear();
+                    self.activity.output_seen.store(false, Ordering::Relaxed);
+                }
                 _ => {}
             }
         }
@@ -391,5 +424,36 @@ mod tests {
             extra: Default::default(),
         }));
         assert!(!activity.busy());
+
+        // `generating` is set only by model output — bookkeeping and the
+        // prompt echo don't count — and cleared on the next prompt.
+        assert!(!activity.generating());
+        block_on(handler.session_update(SessionNotification {
+            session_id: "s".to_string(),
+            update: SessionUpdate::ConfigOptionUpdate(aither_acp::ConfigOptionUpdate {
+                config_options: vec![],
+                meta: None,
+            }),
+            meta: None,
+            extra: Default::default(),
+        }));
+        assert!(!activity.generating());
+        block_on(handler.session_update(SessionNotification {
+            session_id: "s".to_string(),
+            update: SessionUpdate::AgentThoughtChunk(ContentChunk {
+                content: ContentBlock::Text(TextContent {
+                    text: "thinking".to_string(),
+                    annotations: None,
+                    meta: None,
+                }),
+                message_id: None,
+                meta: None,
+            }),
+            meta: None,
+            extra: Default::default(),
+        }));
+        assert!(activity.generating());
+        activity.clear_tools();
+        assert!(!activity.generating());
     }
 }

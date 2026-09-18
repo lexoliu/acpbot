@@ -1126,22 +1126,32 @@ impl ChatActor {
     /// update of any kind), and the silence budget that applies —
     /// `tool_silence` while a tool call is in flight (quiet `exec`/
     /// `web_search`/subagent work is legitimate, not stuckness),
-    /// `nudge_after` otherwise. A zero budget waits forever.
+    /// `generation_silence` once the turn has produced model output
+    /// (thinking between iterations is equally legitimate quiet), and
+    /// `nudge_after` only while the turn has produced nothing at all.
+    /// A zero budget waits forever.
     fn silence(&self) -> (Duration, Duration) {
         let idle_ms = crate::sender::epoch_ms().saturating_sub(
             self.last_action
                 .load(Ordering::Relaxed)
                 .max(self.activity.last_update.load(Ordering::Relaxed)),
         );
-        let busy = self.activity.busy();
-        let tool_silence = self.shared.agent.tool_silence();
-        let nudge_after = self.shared.agent.nudge_after();
-        let budget = if busy && tool_silence.is_zero() {
-            Duration::MAX
-        } else if busy {
-            tool_silence
+        let budget = if self.activity.busy() {
+            let tool_silence = self.shared.agent.tool_silence();
+            if tool_silence.is_zero() {
+                Duration::MAX
+            } else {
+                tool_silence
+            }
+        } else if self.activity.generating() {
+            let generation_silence = self.shared.agent.generation_silence();
+            if generation_silence.is_zero() {
+                Duration::MAX
+            } else {
+                generation_silence
+            }
         } else {
-            nudge_after
+            self.shared.agent.nudge_after()
         };
         (Duration::from_millis(idle_ms), budget)
     }
@@ -1164,8 +1174,9 @@ impl ChatActor {
     }
 
     /// Run one prompt to completion, enforcing the never-keep-them-waiting
-    /// rule: whenever the agent stays silent past
-    /// `[agent] nudge_after_secs` — or `[agent] tool_silence_secs` while a
+    /// rule: whenever the session stays silent past the applicable budget —
+    /// `[agent] nudge_after_secs` while the turn has produced no output,
+    /// `generation_silence_secs` once it has, `tool_silence_secs` while a
     /// tool call is in flight — the turn is cancelled and re-prompted
     /// with a `nudge` event so the agent sends the user an update and
     /// resumes its work. `0` disables the nudge entirely.
@@ -1274,10 +1285,12 @@ impl ChatActor {
                         continue;
                     }
                     let busy = self.activity.busy();
+                    let generating = self.activity.generating();
                     warn!(
                         chat = ?self.router.current(),
                         silent_ms = idle.as_millis() as u64,
-                        busy, "agent silent past the nudge deadline; interrupting"
+                        busy, generating,
+                        "agent silent past the nudge deadline; interrupting"
                     );
                     self.cancel_turn(client, session_id, &mut prompt).await;
                     // The nudged turn gets a fresh silence budget — it must
@@ -1287,6 +1300,8 @@ impl ChatActor {
                         .store(crate::sender::epoch_ms(), Ordering::Relaxed);
                     let text = if busy {
                         tool_stall_event_text(self.router.current().as_ref())
+                    } else if generating {
+                        generation_stall_event_text(self.router.current().as_ref())
                     } else {
                         nudge_event_text(self.router.current().as_ref())
                     };
@@ -1833,6 +1848,18 @@ fn tool_stall_event_text(chat: Option<&ChatKey>) -> String {
     )
 }
 
+/// The `nudge` injected when a turn that had produced output went quiet
+/// with nothing in flight past `generation_silence` — the generation
+/// itself is presumed stalled rather than merely thinking.
+fn generation_stall_event_text(chat: Option<&ChatKey>) -> String {
+    nudge_event(
+        chat,
+        "Your turn went quiet mid-work and was cancelled as stalled. \
+         Send the user a one-line update, then continue the task — or \
+         finish what was already done.",
+    )
+}
+
 /// The `nudge` injected when a turn that owed an answer ended with no
 /// outbound action at all: the model almost certainly wrote its reply as
 /// ordinary text, which the chat never sees.
@@ -2180,19 +2207,21 @@ your own messages, sign-offs, or replies to yourself — your sends produce \
 no events, so talking to yourself just spams the room. One thought shy \
 always beats one bubble too many.
 
-**Never go dark mid-task.** The user must never wait more than ten seconds \
-with nothing from you. The daemon enforces it: a turn that produces \
-nothing — no `chat` call, no tool progress, not even thinking output — \
-for ten seconds is cancelled and re-prompted as a `nudge` event. A tool \
-call in flight gets a long leash instead (`tool_silence_secs`, twenty \
-minutes by default): quiet work is legitimate, but past that the call is \
-killed as hung — say so and retry differently. And a turn that *ends* \
-having never called a `chat` tool gets re-prompted too, because the \
-answer you typed went nowhere. \
+**Never go dark mid-task.** The daemon watches session activity, not just \
+chat output: a turn that produces literally nothing — no `chat` call, no \
+tool progress, not even thinking output — is cancelled after \
+`nudge_after_secs` (ten seconds by default) and re-prompted as a `nudge` \
+event. Once your turn has produced output, quiet thinking between steps \
+is legitimate — the leash is `generation_silence_secs` (three minutes); \
+past that the turn is cancelled as stalled. A tool call in flight gets \
+the longest leash (`tool_silence_secs`, twenty minutes): quiet work is \
+legitimate, but past that the call is killed as hung — say so and retry \
+differently. And a turn that *ends* having never called a `chat` tool \
+gets re-prompted too, because the answer you typed went nowhere. \
 When a `nudge` arrives, your FIRST action is again a `chat` tool call — \
 one line like \\\"still working, X so far\\\" — then you continue the task \
-you were doing. Plan for it: on anything long, send a progress line \
-*before* the silence would hit ten seconds.
+you were doing. On long jobs, an occasional progress line keeps the user \
+oriented even though the watchdog tolerates the quiet.
 
 **Delegate work, stay the main thread.** While your turn runs, EVERY chat \
 waits — you are this bot's single-threaded UI. So a turn is for talking \

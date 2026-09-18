@@ -224,9 +224,17 @@ pub struct AgentConfig {
     pub idle_compact_secs: u64,
     /// Seconds of outbound silence inside a turn before the daemon cancels
     /// the turn and nudges the agent to message the user (default 10).
+    /// Applies only while the turn has produced no model output at all —
+    /// once the model has shown life, `generation_silence_secs` takes over.
     /// `0` disables the nudge.
     #[serde(default = "default_nudge_after_secs")]
     pub nudge_after_secs: u64,
+    /// Seconds of session silence after the model has produced output this
+    /// turn but no tool call is in flight — thinking between iterations is
+    /// legitimate quiet, past this the generation is treated as stalled
+    /// (default 180). `0` waits forever.
+    #[serde(default = "default_generation_silence_secs")]
+    pub generation_silence_secs: u64,
     /// Seconds of total session silence allowed while a tool call is in
     /// flight before the turn is treated as hung and cancelled (default
     /// 1200 — a `web_search`/`exec`/subagent working quietly is normal;
@@ -411,6 +419,10 @@ fn default_nudge_after_secs() -> u64 {
     10
 }
 
+fn default_generation_silence_secs() -> u64 {
+    180
+}
+
 fn default_tool_silence_secs() -> u64 {
     1200
 }
@@ -424,6 +436,11 @@ impl AgentConfig {
     /// The outbound silence that triggers a nudge mid-turn.
     pub fn nudge_after(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.nudge_after_secs)
+    }
+
+    /// The session silence that ends a turn gone quiet mid-generation.
+    pub fn generation_silence(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.generation_silence_secs)
     }
 
     /// The session silence that ends a turn stuck inside a tool call.
@@ -442,6 +459,7 @@ impl Default for AgentConfig {
             isolation: AgentIsolation::default(),
             idle_compact_secs: default_idle_compact_secs(),
             nudge_after_secs: default_nudge_after_secs(),
+            generation_silence_secs: default_generation_silence_secs(),
             tool_silence_secs: default_tool_silence_secs(),
             mcp_servers: Vec::new(),
         }
