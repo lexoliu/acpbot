@@ -1584,7 +1584,9 @@ mod tests {
 
         let gone = block("list_watches", "{}").as_text().unwrap().to_string();
         assert!(!gone.contains("sleep 60"), "{gone}");
-        let unknown = block("cancel_watch", &cancel_args);
+        // A never-registered id is deterministic; re-cancelling the same
+        // id races with the task's own cleanup, so it isn't asserted.
+        let unknown = block("cancel_watch", "{\"id\":\"w_000000000000\"}");
         assert!(unknown.as_text().unwrap().contains("unknown watch"));
     }
 

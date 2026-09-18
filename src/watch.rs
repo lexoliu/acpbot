@@ -22,7 +22,6 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::Mutex;
 
 use async_channel::Sender as ChanSender;
@@ -465,16 +464,27 @@ impl Watchers {
 
 /// `bash -c` with the child in its own process group, so cancelling can
 /// kill the command *and* anything it spawned (a `sleep` inside a loop,
-/// a pipeline, a forked poller) instead of orphaning it.
+/// a pipeline, a forked poller) instead of orphaning it. Watches are a
+/// unix feature — bash and process groups don't exist elsewhere (on
+/// Windows `bash` resolves to the WSL stub, not a shell).
 fn spawn(command: &str) -> io::Result<async_process::Child> {
-    let mut cmd = std::process::Command::new("bash");
-    cmd.arg("-c")
-        .arg(command)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    #[cfg(not(unix))]
+    {
+        let _ = command;
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "watches run bash commands — unix only",
+        ));
+    }
     #[cfg(unix)]
     {
+        use std::process::Stdio;
+        let mut cmd = std::process::Command::new("bash");
+        cmd.arg("-c")
+            .arg(command)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         use std::os::unix::process::CommandExt;
         unsafe {
             cmd.pre_exec(|| {
@@ -484,15 +494,16 @@ fn spawn(command: &str) -> io::Result<async_process::Child> {
                 Ok(())
             });
         }
+        // `Command::from` keeps the std command (pre_exec included) but
+        // marks its stdio as unconfigured, so a bare `spawn()` would
+        // overwrite the pipes with `inherit` — re-declare them through
+        // the async API.
+        let mut cmd = async_process::Command::from(cmd);
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        cmd.spawn()
     }
-    // `Command::from` keeps the std command (pre_exec included) but marks
-    // its stdio as unconfigured, so a bare `spawn()` would overwrite the
-    // pipes with `inherit` — re-declare them through the async API.
-    let mut cmd = async_process::Command::from(cmd);
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    cmd.spawn()
 }
 
 /// Kill the watch's whole process group on unix, or just the child
@@ -648,6 +659,7 @@ mod tests {
         assert!(load_defs(&path).is_empty(), "corrupt file loads empty");
     }
 
+    #[cfg(unix)]
     #[test]
     fn watch_fires_each_line_then_exits() {
         ensure_executor();
@@ -688,6 +700,7 @@ mod tests {
         assert!(!dir.join("watchers.json").exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn nonzero_exit_reports_failed_with_stderr() {
         ensure_executor();
@@ -704,6 +717,7 @@ mod tests {
         assert_eq!(watch.stderr_tail.as_deref(), Some("oops"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn cancel_kills_the_command_and_reports() {
         ensure_executor();
@@ -723,6 +737,7 @@ mod tests {
         assert!(watchers.cancel(&id).is_err(), "second cancel is an error");
     }
 
+    #[cfg(unix)]
     #[test]
     fn restore_respawns_persisted_defs() {
         ensure_executor();
@@ -746,6 +761,7 @@ mod tests {
         assert_eq!(event.watch.as_ref().unwrap().line.as_deref(), Some("back"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn shutdown_emits_nothing_and_keeps_defs() {
         ensure_executor();
@@ -768,6 +784,7 @@ mod tests {
     /// A command that closes stdout early (`exec 1>&-`, a daemonizer)
     /// still runs to its real exit — EOF ends the line stream, not the
     /// process.
+    #[cfg(unix)]
     #[test]
     fn stdout_eof_early_still_waits_for_exit() {
         ensure_executor();
