@@ -48,6 +48,12 @@ idle_compact_secs = 1800
 # 0 disables the interrupt.
 nudge_after_secs = 10
 
+# Seconds of total session silence allowed while a tool call is in
+# flight before the turn is cancelled as hung (default 1200). Quiet
+# `exec`/`web_search`/subagent work is legitimate and gets this leash
+# instead of `nudge_after_secs`. 0 waits forever.
+tool_silence_secs = 1200
+
 # How the agent process is isolated. Default shown; the whole table is
 # optional. Network is never restricted in any mode — the agent must reach
 # its model APIs, and the bridge must reach this daemon.

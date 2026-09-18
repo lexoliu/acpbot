@@ -5,9 +5,10 @@
 //! as plain text is delivered to the chat — output goes through the `chat`
 //! MCP tools only.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use aither_acp::{
     ClientHandler, RequestPermissionOutcome, RequestPermissionParams, RequestPermissionResult,
@@ -30,6 +31,53 @@ use tracing::{debug, warn};
 pub(crate) const MAIN_BLOCKED_TOOLS: &[&str] =
     &["run_command", "send_command_input", "command_status"];
 
+/// What the turn watchdog knows about the live session: *any* update is
+/// activity (thinking, streaming, tool progress — only a truly mute turn
+/// is "silent"), and in-flight tool calls make the turn *busy* — it gets
+/// the generous `tool_silence` budget instead of `nudge_after`, because a
+/// `web_search`/`exec`/subagent working quietly for a minute is normal,
+/// while a silent tool past the budget is genuinely hung.
+#[derive(Debug, Default)]
+pub(crate) struct Activity {
+    /// Epoch ms of the last session notification of any kind.
+    pub last_update: AtomicU64,
+    /// Tool call ids that started and haven't reported a terminal status.
+    /// Keyed by id so `pending → in_progress` transitions don't double.
+    pub live_tools: Mutex<HashSet<String>>,
+}
+
+impl Activity {
+    /// A turn is busy while any tool call is in flight.
+    pub fn busy(&self) -> bool {
+        !self.live_tools.lock().expect("activity").is_empty()
+    }
+
+    /// Drop every tracked call — after a cancelled turn the killed calls
+    /// may never report terminal statuses.
+    pub fn clear_tools(&self) {
+        self.live_tools.lock().expect("activity").clear();
+    }
+
+    /// A status that ends a tool call's lifecycle.
+    fn terminal(status: Option<ToolCallStatus>) -> bool {
+        matches!(
+            status,
+            Some(ToolCallStatus::Completed | ToolCallStatus::Failed)
+        )
+    }
+
+    /// Record one tool-call status: terminal retires the id, anything
+    /// else marks it live (a `pending` → `in_progress` transition just
+    /// re-inserts the same id).
+    fn track(live: &mut HashSet<String>, id: &str, status: Option<ToolCallStatus>) {
+        if Self::terminal(status) {
+            live.remove(id);
+        } else {
+            live.insert(id.to_string());
+        }
+    }
+}
+
 /// Handles agent-to-client traffic for the shared session.
 #[derive(Debug)]
 pub struct BotClientHandler {
@@ -43,21 +91,26 @@ pub struct BotClientHandler {
     /// Reports a blocked tool the moment its call starts; the actor
     /// cancels the turn and re-prompts with a delegation nudge.
     blocked_tool: ChanSender<String>,
+    /// Activity signals the watchdog reads — written on every update.
+    activity: Arc<Activity>,
 }
 
 impl BotClientHandler {
     /// A handler appending to `transcript`, publishing command support
-    /// flags onto `compact_supported`, and reporting calls to
-    /// `MAIN_BLOCKED_TOOLS` on `blocked_tool`.
+    /// flags onto `compact_supported`, reporting calls to
+    /// `MAIN_BLOCKED_TOOLS` on `blocked_tool`, and recording session
+    /// activity into `activity`.
     pub fn new(
         transcript: PathBuf,
         compact_supported: Arc<AtomicBool>,
         blocked_tool: ChanSender<String>,
+        activity: Arc<Activity>,
     ) -> Self {
         Self {
             transcript,
             compact_supported,
             blocked_tool,
+            activity,
         }
     }
 }
@@ -66,6 +119,26 @@ impl ClientHandler for BotClientHandler {
     async fn session_update(&self, notification: SessionNotification) {
         let update = &notification.update;
         debug!(?update, "session update");
+        self.activity
+            .last_update
+            .store(crate::sender::epoch_ms(), Ordering::Relaxed);
+
+        // Tool-call lifecycle for the busy flag. A `user_message_chunk`
+        // means a fresh prompt: whatever ran before is dead, whether or
+        // not the harness bothered to say so.
+        {
+            let mut live = self.activity.live_tools.lock().expect("activity");
+            match update {
+                SessionUpdate::ToolCall(call) => {
+                    Activity::track(&mut live, &call.tool_call_id, call.status);
+                }
+                SessionUpdate::ToolCallUpdate(call) => {
+                    Activity::track(&mut live, &call.tool_call_id, call.status);
+                }
+                SessionUpdate::UserMessageChunk(_) => live.clear(),
+                _ => {}
+            }
+        }
 
         if let SessionUpdate::AvailableCommandsUpdate(commands) = update {
             self.compact_supported.store(
@@ -167,6 +240,7 @@ mod tests {
             PathBuf::from("/tmp/acpbot-test-transcript.log"),
             flag.clone(),
             _tx,
+            Arc::new(Activity::default()),
         );
         assert!(rx.is_empty());
 
@@ -189,6 +263,7 @@ mod tests {
             PathBuf::from("/tmp/acpbot-test-transcript.log"),
             Arc::new(AtomicBool::new(false)),
             tx,
+            Arc::new(Activity::default()),
         );
         let call = |title: &str, kind: Option<ToolKind>, status| SessionNotification {
             session_id: "s".to_string(),
@@ -235,5 +310,86 @@ mod tests {
             ToolCallStatus::InProgress,
         )));
         assert_eq!(rx.try_recv().as_deref(), Ok("send_command_input"));
+    }
+
+    /// Every update is activity, and in-flight tool calls make the turn
+    /// busy: terminal statuses retire the id, and a fresh prompt clears
+    /// whatever a cancelled turn left behind.
+    #[test]
+    fn session_updates_drive_the_activity_signals() {
+        use aither_acp::{ContentBlock, ContentChunk, TextContent, ToolCall, ToolCallUpdate};
+        let activity = Arc::new(Activity::default());
+        let (tx, _rx) = async_channel::unbounded::<String>();
+        let handler = BotClientHandler::new(
+            PathBuf::from("/tmp/acpbot-test-transcript.log"),
+            Arc::new(AtomicBool::new(false)),
+            tx,
+            activity.clone(),
+        );
+        let tool = |id: &str, status| SessionNotification {
+            session_id: "s".to_string(),
+            update: SessionUpdate::ToolCall(ToolCall {
+                tool_call_id: id.to_string(),
+                title: "web_search".to_string(),
+                kind: None,
+                status: Some(status),
+                content: Vec::new(),
+                locations: Vec::new(),
+                raw_input: None,
+                raw_output: None,
+                meta: None,
+            }),
+            meta: None,
+            extra: Default::default(),
+        };
+        let tool_update = |id: &str, status| SessionNotification {
+            session_id: "s".to_string(),
+            update: SessionUpdate::ToolCallUpdate(ToolCallUpdate {
+                tool_call_id: id.to_string(),
+                status: Some(status),
+                title: None,
+                kind: None,
+                content: None,
+                locations: None,
+                raw_input: None,
+                raw_output: None,
+                meta: None,
+            }),
+            meta: None,
+            extra: Default::default(),
+        };
+
+        // Any update at all moves the clock — the watchdog's "silence"
+        // is a truly mute session, not a turn without chat sends.
+        assert_eq!(activity.last_update.load(Ordering::Relaxed), 0);
+        block_on(handler.session_update(tool("1", ToolCallStatus::InProgress)));
+        assert!(activity.last_update.load(Ordering::Relaxed) > 0);
+        assert!(activity.busy());
+
+        // A status transition on the same id stays a single live call.
+        block_on(handler.session_update(tool("1", ToolCallStatus::InProgress)));
+        assert!(activity.busy());
+        block_on(handler.session_update(tool_update("1", ToolCallStatus::Completed)));
+        assert!(!activity.busy());
+
+        // A call cancelled mid-turn may never report terminal — the next
+        // prompt's user chunk clears it.
+        block_on(handler.session_update(tool("9", ToolCallStatus::Pending)));
+        assert!(activity.busy());
+        block_on(handler.session_update(SessionNotification {
+            session_id: "s".to_string(),
+            update: SessionUpdate::UserMessageChunk(ContentChunk {
+                content: ContentBlock::Text(TextContent {
+                    text: "next".to_string(),
+                    annotations: None,
+                    meta: None,
+                }),
+                message_id: None,
+                meta: None,
+            }),
+            meta: None,
+            extra: Default::default(),
+        }));
+        assert!(!activity.busy());
     }
 }
