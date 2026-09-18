@@ -42,11 +42,18 @@ model = "swe-2-medium"
 # stretch — prompt caches outlive this, so compacting is cheap and the
 # next message pays for a smaller context. 0 disables.
 idle_compact_secs = 1800
-# Seconds of outbound silence inside a turn before the daemon cancels the
-# turn and sends the agent a `nudge` event — the agent must message the
-# user, then resumes its task. The user never waits longer than this.
+# Seconds of silence inside a turn before the daemon cancels it and sends
+# the agent a `nudge` event — the agent must message the user, then
+# resumes its task. Applies only while the turn has produced no model
+# output at all; once it has, `generation_silence_secs` takes over.
 # 0 disables the interrupt.
 nudge_after_secs = 10
+
+# Seconds of session silence once the model has produced output this turn
+# but no tool call is in flight — quiet thinking between iterations is
+# legitimate, past this the generation is treated as stalled and the turn
+# is cancelled (default 180). 0 waits forever.
+# generation_silence_secs = 180
 
 # Seconds of total session silence allowed while a tool call is in
 # flight before the turn is cancelled as hung (default 1200). Quiet

@@ -42,10 +42,13 @@ must do the same (see `ensure_executor` in test modules).
   Forwards event batches as prompts, runs the first-reply watchdog and
   the idle-compaction timer. The mid-turn nudge watchdog measures
   *session* silence — `handler.rs`'s `Activity` records every session
-  update and tracks in-flight tool calls, so a turn doing quiet tool
-  work gets `tool_silence_secs` (default 20 min) instead of the 10 s
-  `nudge_after_secs`; cancelling a turn clears the bookkeeping since
-  killed calls may never report a terminal status. Every event pulled
+  update, tracks in-flight tool calls, and marks whether the model has
+  produced output this turn. Three budgets: `nudge_after_secs` (10 s)
+  while the turn has produced nothing at all, `generation_silence_secs`
+  (3 min) once it has (quiet thinking between iterations is legitimate),
+  and `tool_silence_secs` (20 min) while a tool call is in flight;
+  cancelling a turn clears the bookkeeping since killed calls may never
+  report a terminal status. Every event pulled
   off the wire is journaled
   to `inflight.json` — `sent` while its turn is unconfirmed, `queued`
   when coalesced mid-turn — and a confirmed turn end clears it, so a
