@@ -17,6 +17,7 @@ use aither_acp::{
 use aither_mcp::protocol::JsonRpcError;
 use async_channel::Sender as ChanSender;
 use futures_lite::io::AsyncWriteExt;
+use serde_json::Value;
 use tracing::{debug, warn};
 
 /// Harness tool names that execute shell commands but may arrive with no
@@ -26,8 +27,9 @@ use tracing::{debug, warn};
 /// translation of `run_command`) reports for command execution. The shared
 /// agent is the bot's single-threaded UI: a command on its own turn blocks
 /// every chat for the command's duration, so these calls are cancelled the
-/// moment the tool step appears — command work belongs inside subagents,
-/// whose tool calls run in their own conversations and never surface here.
+/// moment the tool step appears — command work belongs inside subagents.
+/// Subagent calls do surface on this stream under a `subagent_context`
+/// `_meta` marker; `is_subagent_call` exempts them.
 pub(crate) const MAIN_BLOCKED_TOOLS: &[&str] =
     &["run_command", "send_command_input", "command_status"];
 
@@ -38,6 +40,19 @@ pub(crate) const MAIN_BLOCKED_TOOLS: &[&str] =
 /// (graceful deny).
 fn is_command_tool(kind: Option<ToolKind>, title: &str) -> bool {
     kind == Some(ToolKind::Execute) || MAIN_BLOCKED_TOOLS.contains(&title)
+}
+
+/// Whether a tool call belongs to a subagent. Devin surfaces subagent
+/// calls on the parent session's update stream under
+/// `cognition.ai/subagent_context` — they execute in the subagent's own
+/// conversation, so shared-thread enforcement (the blocked-tool cancel,
+/// the permission deny) must not touch them: cancelling the parent turn
+/// kills the subagent with it.
+fn is_subagent_call(meta: &Option<Value>) -> bool {
+    meta.as_ref().and_then(Value::as_object).is_some_and(|obj| {
+        obj.keys()
+            .any(|k| k == "subagent_context" || k.ends_with("/subagent_context"))
+    })
 }
 
 /// What the turn watchdog knows about the live session: *any* update is
@@ -199,13 +214,16 @@ impl ClientHandler for BotClientHandler {
         // Terminal-status updates don't re-report — a `Completed`/`Failed`
         // notification is after the fact, nothing left to block. Devin
         // announces exec calls with `status` unset, so anything short of
-        // terminal flags.
+        // terminal flags. Subagent calls also surface on this stream —
+        // marked in `_meta` — and are exempt: they run in their own
+        // conversation and the cancel would kill them too.
         if let SessionUpdate::ToolCall(call) = update
             && !matches!(
                 call.status,
                 Some(ToolCallStatus::Completed | ToolCallStatus::Failed)
             )
             && is_command_tool(call.kind, &call.title)
+            && !is_subagent_call(&call.meta)
         {
             let _ = self.blocked_tool.try_send(call.title.clone());
         }
@@ -239,7 +257,7 @@ impl ClientHandler for BotClientHandler {
         // delegate instead of losing the turn to a cancel. Only reachable
         // when the session mode routes decisions here (a bypass-mode
         // harness resolves permissions internally and never asks).
-        if is_command_tool(call.kind, &call.title) {
+        if is_command_tool(call.kind, &call.title) && !is_subagent_call(&call.meta) {
             warn!(tool = %call.title, "denying command tool on the shared thread");
             let outcome = params
                 .options
@@ -340,7 +358,10 @@ mod tests {
             tx,
             Arc::new(Activity::default()),
         );
-        let call = |title: &str, kind: Option<ToolKind>, status: Option<ToolCallStatus>| {
+        let call = |title: &str,
+                    kind: Option<ToolKind>,
+                    status: Option<ToolCallStatus>,
+                    meta: Option<Value>| {
             SessionNotification {
                 session_id: "s".to_string(),
                 update: SessionUpdate::ToolCall(ToolCall {
@@ -352,7 +373,7 @@ mod tests {
                     locations: Vec::new(),
                     raw_input: None,
                     raw_output: None,
-                    meta: None,
+                    meta,
                 }),
                 meta: None,
                 extra: Default::default(),
@@ -363,11 +384,13 @@ mod tests {
             "view_file",
             Some(ToolKind::Read),
             Some(ToolCallStatus::InProgress),
+            None,
         )));
         block_on(handler.session_update(call(
             "run_command",
             Some(ToolKind::Execute),
             Some(ToolCallStatus::Completed),
+            None,
         )));
         assert!(rx.is_empty());
 
@@ -379,9 +402,10 @@ mod tests {
             "exec",
             Some(ToolKind::Execute),
             Some(ToolCallStatus::InProgress),
+            None,
         )));
         assert_eq!(rx.try_recv().as_deref(), Ok("exec"));
-        block_on(handler.session_update(call("ffmpeg", Some(ToolKind::Execute), None)));
+        block_on(handler.session_update(call("ffmpeg", Some(ToolKind::Execute), None, None)));
         assert_eq!(rx.try_recv().as_deref(), Ok("ffmpeg"));
 
         // An unclassified harness still trips on the known names.
@@ -389,8 +413,22 @@ mod tests {
             "send_command_input",
             None,
             Some(ToolCallStatus::InProgress),
+            None,
         )));
         assert_eq!(rx.try_recv().as_deref(), Ok("send_command_input"));
+
+        // A command-shaped call carrying devin's `subagent_context` runs
+        // in the subagent's own conversation — exempt, or cancelling the
+        // parent turn would kill the subagent's work with it.
+        block_on(handler.session_update(call(
+            "Ran which, ls",
+            Some(ToolKind::Execute),
+            None,
+            Some(serde_json::json!({
+                "cognition.ai/subagent_context": {"parentAgentId": "abc"}
+            })),
+        )));
+        assert!(rx.is_empty());
     }
 
     /// `request_permission` refuses command tools in-band and allows the
@@ -451,6 +489,20 @@ mod tests {
         let allowed =
             block_on(handler.request_permission(params("view_file", Some(ToolKind::Read))))
                 .unwrap();
+        assert_eq!(
+            allowed.outcome,
+            RequestPermissionOutcome::Selected {
+                option_id: "allow_once".to_string()
+            }
+        );
+
+        // A subagent's command call is not ours to refuse — it runs in
+        // the subagent's own conversation, off the shared thread.
+        let mut subagent = params("exec", Some(ToolKind::Execute));
+        subagent.tool_call.meta = Some(serde_json::json!({
+            "cognition.ai/subagent_context": {"parentAgentId": "abc"}
+        }));
+        let allowed = block_on(handler.request_permission(subagent)).unwrap();
         assert_eq!(
             allowed.outcome,
             RequestPermissionOutcome::Selected {
