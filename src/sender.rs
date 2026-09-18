@@ -391,11 +391,14 @@ impl Sender {
             let markup = if i == last { buttons.clone() } else { None };
             id = match &self.platform {
                 Platform::Telegram(inner) => {
+                    // Markdown → text+entities: Telegram never re-parses,
+                    // so `**bold**` works even against CJK text.
+                    let md = botkit_telegram::markdown::render(bubble);
                     inner
                         .client
                         .send_message(
                             inner.chat_id,
-                            bubble,
+                            md.formatted(),
                             self.thread(),
                             markup.map(ReplyMarkup::InlineKeyboard),
                         )
@@ -457,10 +460,11 @@ impl Sender {
             let markup = if i == last { buttons.clone() } else { None };
             id = match &self.platform {
                 Platform::Telegram(inner) => {
+                    let md = botkit_telegram::markdown::render(bubble);
                     if i == 0 {
                         inner
                             .client
-                            .send_reply_markup(inner.chat_id, message_id, bubble, markup)
+                            .send_reply_markup(inner.chat_id, message_id, md.formatted(), markup)
                             .await
                             .map_err(|e| bot_err(e, message_id))?
                     } else {
@@ -468,7 +472,7 @@ impl Sender {
                             .client
                             .send_message(
                                 inner.chat_id,
-                                bubble,
+                                md.formatted(),
                                 self.thread(),
                                 markup.map(ReplyMarkup::InlineKeyboard),
                             )
@@ -653,18 +657,21 @@ impl Sender {
         self.inter_message_pause().await;
         self.spoke();
         let id = match &self.platform {
-            Platform::Telegram(inner) => inner
-                .client
-                .send_media(
-                    inner.chat_id,
-                    media_kind(path),
-                    FileSource::Path(path.to_path_buf()),
-                    filename(path)?,
-                    caption,
-                    self.thread(),
-                )
-                .await
-                .map_err(SenderError::from),
+            Platform::Telegram(inner) => {
+                let caption = caption.map(botkit_telegram::markdown::render);
+                inner
+                    .client
+                    .send_media(
+                        inner.chat_id,
+                        media_kind(path),
+                        FileSource::Path(path.to_path_buf()),
+                        filename(path)?,
+                        caption.as_ref().map(|c| c.formatted()),
+                        self.thread(),
+                    )
+                    .await
+                    .map_err(SenderError::from)
+            }
             Platform::Cli(inner) => {
                 let message_id = inner.hub.next_message_id();
                 inner.hub.emit(Outbound::File(OutboundFile {
@@ -718,11 +725,20 @@ impl Sender {
         self.inter_message_pause().await;
         self.spoke();
         let id = match &self.platform {
-            Platform::Telegram(inner) => inner
-                .client
-                .send_media_id(inner.chat_id, kind, file_id, caption, self.thread())
-                .await
-                .map_err(SenderError::from),
+            Platform::Telegram(inner) => {
+                let caption = caption.map(botkit_telegram::markdown::render);
+                inner
+                    .client
+                    .send_media_id(
+                        inner.chat_id,
+                        kind,
+                        file_id,
+                        caption.as_ref().map(|c| c.formatted()),
+                        self.thread(),
+                    )
+                    .await
+                    .map_err(SenderError::from)
+            }
             Platform::Cli(inner) => {
                 let message_id = inner.hub.next_message_id();
                 inner.hub.emit(Outbound::File(OutboundFile {
@@ -948,11 +964,14 @@ impl Sender {
     /// Edit the text of a message the bot sent.
     pub async fn edit(&self, message_id: i64, text: &str) -> Result<(), SenderError> {
         let result = match &self.platform {
-            Platform::Telegram(inner) => inner
-                .client
-                .edit_message_text(inner.chat_id, message_id, text, None)
-                .await
-                .map_err(|e| bot_err(e, message_id)),
+            Platform::Telegram(inner) => {
+                let md = botkit_telegram::markdown::render(text);
+                inner
+                    .client
+                    .edit_message_text(inner.chat_id, message_id, md.formatted(), None)
+                    .await
+                    .map_err(|e| bot_err(e, message_id))
+            }
             Platform::Cli(inner) => {
                 inner.hub.emit(Outbound::Edit(OutboundEdit {
                     chat: inner.chat.clone(),
