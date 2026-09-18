@@ -51,7 +51,11 @@ must do the same (see `ensure_executor` in test modules).
   turn's triggering chat, which tools' optional `chat` argument defaults to.
 - `sender.rs` — `Platform` enum (`Telegram`, `Discord`, `Cli`, test `Record`):
   every
-  outbound tool call lands here. `probe_message` checks whether a message
+  outbound tool call lands here. Telegram-bound text (and media captions)
+  is rendered from markdown into `entities` via
+  `botkit_telegram::markdown::render` — offsets computed here, so emphasis
+  next to CJK or full-width punctuation works and no `parse_mode` escaping
+  is involved. `probe_message` checks whether a message
   still exists (a no-op `editMessageReplyMarkup` answers "not modified" on
   a live message, "to edit not found" on a deleted one) — Telegram pushes
   no deletion update, so deletions are only ever learned after the fact:

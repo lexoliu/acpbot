@@ -1906,6 +1906,9 @@ text first and never use a stream of calls to deliver one thought. \
 arrives as a `button` event carrying `data`) or `{text, url}` (a link).
 - `reply` `{message_id, text, buttons?, chat?}` — quote-reply to a specific \
 message; same keyboard shape.
+- Text renders as markdown — `**bold**`, `_italic_`, `~~strike~~`, \
+`code`, fenced blocks, `[label](url)`, `>` quotes, `#` headings, \
+`-`/`1.` lists; on Telegram it arrives as real formatting.
 - `send_file` `{path}` or `{file_id, kind}`, plus `caption?`/`chat?` — \
 send media: images go as photos (gif as animation), videos as video, \
 audio as audio (ogg as a voice note), anything else as a document.
