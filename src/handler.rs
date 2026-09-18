@@ -187,9 +187,15 @@ impl ClientHandler for BotClientHandler {
         // turn loop can cancel before the command's duration becomes
         // every chat's wait. `kind == Execute` is the harness-agnostic
         // signal; the name list catches harnesses that leave `kind` unset.
-        // Completed-status updates don't re-report.
+        // Terminal-status updates don't re-report — a `Completed`/`Failed`
+        // notification is after the fact, nothing left to block. Devin
+        // announces exec calls with `status` unset, so anything short of
+        // terminal flags.
         if let SessionUpdate::ToolCall(call) = update
-            && call.status == Some(ToolCallStatus::InProgress)
+            && !matches!(
+                call.status,
+                Some(ToolCallStatus::Completed | ToolCallStatus::Failed)
+            )
             && (call.kind == Some(ToolKind::Execute)
                 || MAIN_BLOCKED_TOOLS.contains(&call.title.as_str()))
         {
@@ -298,49 +304,55 @@ mod tests {
             tx,
             Arc::new(Activity::default()),
         );
-        let call = |title: &str, kind: Option<ToolKind>, status| SessionNotification {
-            session_id: "s".to_string(),
-            update: SessionUpdate::ToolCall(ToolCall {
-                tool_call_id: "1".to_string(),
-                title: title.to_string(),
-                kind,
-                status: Some(status),
-                content: Vec::new(),
-                locations: Vec::new(),
-                raw_input: None,
-                raw_output: None,
+        let call = |title: &str, kind: Option<ToolKind>, status: Option<ToolCallStatus>| {
+            SessionNotification {
+                session_id: "s".to_string(),
+                update: SessionUpdate::ToolCall(ToolCall {
+                    tool_call_id: "1".to_string(),
+                    title: title.to_string(),
+                    kind,
+                    status,
+                    content: Vec::new(),
+                    locations: Vec::new(),
+                    raw_input: None,
+                    raw_output: None,
+                    meta: None,
+                }),
                 meta: None,
-            }),
-            meta: None,
-            extra: Default::default(),
+                extra: Default::default(),
+            }
         };
 
         block_on(handler.session_update(call(
             "view_file",
             Some(ToolKind::Read),
-            ToolCallStatus::InProgress,
+            Some(ToolCallStatus::InProgress),
         )));
         block_on(handler.session_update(call(
             "run_command",
             Some(ToolKind::Execute),
-            ToolCallStatus::Completed,
+            Some(ToolCallStatus::Completed),
         )));
         assert!(rx.is_empty());
 
         // A spec-conformant harness (devin's `exec`) reports the kind —
-        // any name with `Execute` is a command.
+        // any name with `Execute` is a command. Devin announces exec
+        // calls with `status` unset — a missing status is a start, not
+        // an after-the-fact report.
         block_on(handler.session_update(call(
             "exec",
             Some(ToolKind::Execute),
-            ToolCallStatus::InProgress,
+            Some(ToolCallStatus::InProgress),
         )));
         assert_eq!(rx.try_recv().as_deref(), Ok("exec"));
+        block_on(handler.session_update(call("ffmpeg", Some(ToolKind::Execute), None)));
+        assert_eq!(rx.try_recv().as_deref(), Ok("ffmpeg"));
 
         // An unclassified harness still trips on the known names.
         block_on(handler.session_update(call(
             "send_command_input",
             None,
-            ToolCallStatus::InProgress,
+            Some(ToolCallStatus::InProgress),
         )));
         assert_eq!(rx.try_recv().as_deref(), Ok("send_command_input"));
     }
