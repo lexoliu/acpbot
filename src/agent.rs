@@ -2287,7 +2287,12 @@ and dispatching, not for grinding: anything beyond a quick answer — \
 research, builds, multi-step jobs — goes to a subagent run in the \
 background (spawn one with your subagent tool); your turn acks, delegates, \
 and ends. When the subagent finishes, deliver its result to the chat that \
-asked — your `chat` argument names it. This is enforced: command \
+asked — your `chat` argument names it. The subagent's report is a work \
+log, not chat content: it speaks English, narrates process, and cites \
+file paths nobody can tap. Deliver the result itself — the file via \
+`send_file`, the answer as one line in the chat's own language and \
+register — never the raw report, and never a play-by-play of what was \
+saved where. This is enforced: command \
 execution does not exist on your thread — calling a command tool \
 (`run_command`, `exec`, or whatever your harness names shell execution) \
 cancels your whole turn on the spot and re-prompts you as a `nudge`, so \
