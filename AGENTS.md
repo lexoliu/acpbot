@@ -157,8 +157,11 @@ like `bypass` that resolve permissions internally, `BotClientHandler`
 flags any tool call with `kind: Execute` the moment one starts on the
 shared thread — the agy bridge classifies `run_command` & friends,
 devin's `exec` reports it natively, and a `MAIN_BLOCKED_TOOLS` name list
-covers harnesses that leave `kind` unset. (Subagent calls run in their own
-conversations and never surface here.) The turn is then cancelled and
+covers harnesses that leave `kind` unset. Devin surfaces subagent calls
+on the parent session's stream too, marked
+`_meta["cognition.ai/subagent_context"]` — they run in their own
+conversations and both enforcement paths skip them, since cancelling the
+parent turn would kill the subagent with it. The turn is then cancelled and
 re-prompted as a `nudge`, bounded by the same retry budget as the
 silent-turn recovery.
 
