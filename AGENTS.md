@@ -27,7 +27,9 @@ must do the same (see `ensure_executor` in test modules).
 - `bot.rs` — platform wiring: every update becomes a `ChatEvent` on the
   dispatcher channel (`build`/`build_discord`/`build_cli`). Group messages get
   `attention`: `"direct"` (reply to the bot, @-mention, command, button) vs
-  `"ambient"` (room chatter the agent may still answer). Needs the bot's own
+  `"ambient"` (room chatter forwarded for context; the protocol doc tells
+  the agent to stay silent unless the message addresses it). Needs the
+  bot's own
   identity — `getMe`/`GET /users/@me` — fetched once at startup.
 - `chat.rs` — `ChatEvent`, the JSON schema the agent sees; it is documented
   again in the agent's `AGENTS.md` managed block, so the two never drift.
