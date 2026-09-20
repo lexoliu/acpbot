@@ -133,8 +133,8 @@ fn run(config_path: &Path) -> Result<(), MainError> {
                 warn!(
                     "bot privacy mode is ON — Telegram only delivers commands, \
                      replies and mentions; ambient group messages never arrive \
-                     (except where the bot is a group admin — admins see all). \
-                     Disable it via @BotFather for topic-following"
+                     (except where the bot is a group admin — admins see all), \
+                     so `history` carries only what was addressed to the bot"
                 );
             }
             info!(bot = ?me.username, id = me.id, "bot identity");

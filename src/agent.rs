@@ -765,12 +765,25 @@ impl ChatActor {
         // leading queue events were already dispatched once — the turn
         // tags them so the agent checks history before re-answering.
         let mut pending: Vec<ChatEvent> = Vec::new();
-        let mut replayed = self.inflight.sent.len();
         // Clone, don't drain: `inflight` mirrors the journal file until the
         // next `persist_inflight`, so the queue re-seeds while the file
-        // still covers every journaled event.
-        pending.extend(self.inflight.sent.iter().cloned());
-        pending.extend(self.inflight.queued.iter().cloned());
+        // still covers every journaled event. Ambient events a pre-gate
+        // journal carried stay history-only under the new policy.
+        pending.extend(
+            self.inflight
+                .sent
+                .iter()
+                .filter(|&e| dispatches(e))
+                .cloned(),
+        );
+        let mut replayed = pending.len();
+        pending.extend(
+            self.inflight
+                .queued
+                .iter()
+                .filter(|&e| dispatches(e))
+                .cloned(),
+        );
         // `true` after a turn errored: its batch went back to `pending`,
         // but a persistently failing turn must wait for a fresh event
         // before re-dispatching instead of spinning.
@@ -800,21 +813,30 @@ impl ChatActor {
                     }
                 };
                 self.log_event(&first);
-                self.inflight.queued.push(first.clone());
-                self.persist_inflight();
-                pending.push(first);
+                if dispatches(&first) {
+                    self.inflight.queued.push(first.clone());
+                    self.persist_inflight();
+                    pending.push(first);
+                }
                 await_fresh = false;
             }
             idle_compacted = false;
             // Coalesce events that arrived while a turn was in flight —
             // a batch can mix chats, and each event lands in its own
-            // chat's IM record.
+            // chat's IM record. Ambient events stop at the record: they
+            // never join the queue, so the agent only ever sees events
+            // addressed to it.
             while let Ok(event) = rx.try_recv() {
                 self.log_event(&event);
-                self.inflight.queued.push(event.clone());
-                pending.push(event);
+                if dispatches(&event) {
+                    self.inflight.queued.push(event.clone());
+                    pending.push(event);
+                }
             }
             self.persist_inflight();
+            if pending.is_empty() {
+                continue;
+            }
             let batch = std::mem::take(&mut pending);
             // Everything queued becomes this dispatch's `sent` — journaled
             // before the prompt runs, so a restart mid-turn replays the
@@ -1285,10 +1307,13 @@ impl ChatActor {
                         return Ok(PromptEnd::Stopped);
                     }
                     // Pulled but not yet prompted — journal it so a crash
-                    // or shutdown mid-turn re-delivers it next run.
-                    self.inflight.queued.push((*event).clone());
-                    self.persist_inflight();
-                    pending.push(*event);
+                    // or shutdown mid-turn re-delivers it next run. Ambient
+                    // events are already in IM history; they never queue.
+                    if dispatches(&event) {
+                        self.inflight.queued.push((*event).clone());
+                        self.persist_inflight();
+                        pending.push(*event);
+                    }
                 }
                 Race::Tick => {
                     let (idle, budget) = self.silence();
@@ -1873,9 +1898,18 @@ fn nudge_event(chat: Option<&ChatKey>, note: &str) -> String {
     event.to_string()
 }
 
+/// Whether an event is ever dispatched to the agent as a prompt. `ambient`
+/// events — group chatter not addressed to the bot — are journaled to IM
+/// history for context but never prompted: the bot speaks only when
+/// spoken to (reply, @-mention, command, button, DM).
+fn dispatches(event: &ChatEvent) -> bool {
+    event.attention != "ambient"
+}
+
 /// Whether an event expects a visible answer: a direct message, command,
-/// or button press. `reaction`/`edited`/`stop` events and ambient chatter
-/// can legitimately end a turn with no output.
+/// or button press. `reaction`/`edited`/`stop` events can legitimately
+/// end a turn with no output (ambient chatter never reaches a batch at
+/// all — see [`dispatches`]).
 fn wants_answer(event: &ChatEvent) -> bool {
     event.attention == "direct"
         && matches!(event.kind.as_str(), "message" | "command" | "button")
@@ -2234,19 +2268,14 @@ tool call. Answering in plain text means the user sees nothing. Silence is \
 allowed when a response isn't warranted — but silence is ending the turn \
 with no chat tool call, not writing a reply that gets discarded.
 
-**In group chats, `attention` decides whether you speak at all.** Every \
-event carries `attention`: `\"direct\"` — a private message, a reply to \
-one of your messages, an @-mention, a command aimed at you, or a button \
-press — the user is talking to you and expects an answer; or \
-`\"ambient\"` — room chatter forwarded only so you have context. An \
-`ambient` event gets no response: end the turn with no `chat` call, not \
-even a `react`. The one exception is a message addressed to you — it \
-names you, replies to you without the platform flagging it, or answers \
-something you just asked. A message you could merely add to, answer on \
-the room's behalf, or react to is not addressed to you — being able to \
-help is not an invitation. When unsure, stay silent; anyone who wants \
-you can @ you. `chat_type` (`private`/`group`/`supergroup`) tells you \
-the room you are in.
+**Everything you see is addressed to you.** Every event carries \
+`attention` = `\"direct\"` — a private message, a reply to one of your \
+messages, an @-mention, a command aimed at you, or a button press — \
+because those are the only events the daemon delivers. Group chatter \
+that doesn't address you never arrives: it's journaled to `history` \
+for context but not sent here, so when an answer needs the room's \
+backstory, read `history`/`search_history` first. `chat_type` \
+(`private`/`group`/`supergroup`) tells you the room you are in.
 
 **Talk in bubbles the size people actually send.** Look at the chat \
 history around you: real messages are one short thought each. Match that \
@@ -2318,8 +2347,9 @@ events arrive together):
 
 `type` is `message`, `command`, `button`, `reaction`, `edited`, `watch`, \
 or `nudge`. `ts` is the event's epoch-seconds timestamp (the platform's \
-message/edit/reaction time). `attention` is `direct` or `ambient` — see \
-the group rule above. `command` events \
+message/edit/reaction time). `attention` is always `\"direct\"` — \
+ambient room chatter is journaled to `history`, never delivered. \
+`command` events \
 carry `command.name`/`command.args`; `button` events carry `button` (the \
 callback id) and the `message_id` of the message the button was attached \
 to. A `reaction` event means a user changed reactions on `message_id`: \
@@ -2521,6 +2551,28 @@ pub(super) mod tests {
         button.text = None;
         button.button = Some("yes".to_string());
         assert!(wants_answer(&button));
+    }
+
+    /// Ambient events are journaled to IM history but never dispatched —
+    /// everything that reaches a prompt is addressed to the bot.
+    #[test]
+    fn dispatches_gates_on_attention() {
+        assert!(dispatches(&test_event("hi", 1)));
+
+        let mut ambient = test_event("room chatter", 2);
+        ambient.attention = "ambient".into();
+        assert!(!dispatches(&ambient));
+
+        // Kind doesn't matter — an ambient reaction/edit drops too, while
+        // direct non-message events (watch, reaction in a DM) still prompt.
+        let mut ambient_reaction = ambient.clone();
+        ambient_reaction.kind = "reaction".into();
+        assert!(!dispatches(&ambient_reaction));
+
+        let mut watch = test_event("", 3);
+        watch.kind = "watch".into();
+        watch.text = None;
+        assert!(dispatches(&watch));
     }
 
     /// Both nudge variants ride the same envelope; the silent-turn one

@@ -212,8 +212,8 @@ pub struct ChatEvent {
     pub ts: i64,
     /// Whether the event is aimed at the bot: `"direct"` (private chat,
     /// reply to a bot message, @-mention, command, button press) or
-    /// `"ambient"` (group chatter forwarded for context — answer only
-    /// when the message addresses the bot itself).
+    /// `"ambient"` (group chatter not addressing the bot — journaled to
+    /// IM history, never dispatched to the agent).
     pub attention: String,
     /// The chat's shape on the platform — `private`, `group`, `supergroup`,
     /// or `channel` — when the platform reports it.
