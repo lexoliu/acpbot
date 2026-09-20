@@ -27,9 +27,8 @@ must do the same (see `ensure_executor` in test modules).
 - `bot.rs` — platform wiring: every update becomes a `ChatEvent` on the
   dispatcher channel (`build`/`build_discord`/`build_cli`). Group messages get
   `attention`: `"direct"` (reply to the bot, @-mention, command, button) vs
-  `"ambient"` (room chatter forwarded for context; the protocol doc tells
-  the agent to stay silent unless the message addresses it). Needs the
-  bot's own
+  `"ambient"` (room chatter journaled to IM history but never dispatched —
+  the agent only ever sees events addressed to it). Needs the bot's own
   identity — `getMe`/`GET /users/@me` — fetched once at startup.
 - `chat.rs` — `ChatEvent`, the JSON schema the agent sees; it is documented
   again in the agent's `AGENTS.md` managed block, so the two never drift.
@@ -53,7 +52,9 @@ must do the same (see `ensure_executor` in test modules).
   (3 min) once it has (quiet thinking between iterations is legitimate),
   and `tool_silence_secs` (20 min) while a tool call is in flight;
   cancelling a turn clears the bookkeeping since killed calls may never
-  report a terminal status. Every event pulled
+  report a terminal status. Ambient events stop at `log_event` — they
+  reach IM history and the registry but never `pending`, so a prompt only
+  ever carries `direct` events. Every dispatchable event pulled
   off the wire is journaled
   to `inflight.json` — `sent` while its turn is unconfirmed, `queued`
   when coalesced mid-turn — and a confirmed turn end clears it, so a

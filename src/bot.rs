@@ -651,8 +651,8 @@ fn chat_kind(update: &Update) -> Option<&'static str> {
 /// bot, bare `/command` invocations and `/command@username` aimed at the
 /// bot, and button presses (keyboards only exist on the bot's own
 /// messages). `/command@other` and all other room traffic is ambient:
-/// the agent still sees it and may answer when it semantically continues
-/// the conversation.
+/// journaled to IM history but never dispatched to the agent — the bot
+/// speaks only when spoken to.
 fn attention(update: &Update, me: &BotIdentity) -> &'static str {
     let direct = match &update.kind {
         UpdateKind::Message(m) | UpdateKind::EditedMessage(m) => {

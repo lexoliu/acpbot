@@ -8,8 +8,9 @@
 # stdio = true                  # or drive the bot over stdin/stdout
 
 # kind = "discord" — the gateway websocket backend. Guild messages that
-# mention or reply to the bot are `direct`, other guild traffic arrives
-# `ambient`; DMs are always direct.
+# mention or reply to the bot are `direct`, other guild traffic is
+# `ambient` (journaled to history, never dispatched); DMs are always
+# direct.
 # [platform]
 # kind = "discord"
 # token_env = "DISCORD_BOT_TOKEN"          # preferred over a literal token
