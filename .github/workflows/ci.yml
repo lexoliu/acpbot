@@ -17,7 +17,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  RUST_TOOLCHAIN: 1.97.1
+  RUST_TOOLCHAIN: 1.100
 
 jobs:
   lint:
