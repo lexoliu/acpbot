@@ -10,9 +10,9 @@ keywords = ["acp", "telegram", "chatbot", "agent"]
 categories = ["command-line-utilities"]
 
 [dependencies]
-aither-core = { git = "https://github.com/May-Agent/aither", branch = "feat/acp-v1v2-redesign", default-features = false, features = ["std", "serde", "derive"] }
-aither-mcp = { git = "https://github.com/May-Agent/aither", branch = "feat/acp-v1v2-redesign", default-features = false, features = ["server"] }
-aither-acp = { git = "https://github.com/May-Agent/aither", branch = "feat/acp-v1v2-redesign", features = ["process"] }
+aither-core = { git = "https://github.com/May-Agent/aither", branch = "main", default-features = false, features = ["std", "serde", "derive"] }
+aither-mcp = { git = "https://github.com/May-Agent/aither", branch = "main", default-features = false, features = ["server"] }
+aither-acp = { git = "https://github.com/May-Agent/aither", branch = "main", features = ["process"] }
 botkit-core = { path = "../botkit/core", version = "0.2" }
 botkit-telegram = { path = "../botkit/telegram", version = "0.2" }
 botkit-cli = { path = "../botkit/cli", version = "0.1" }
