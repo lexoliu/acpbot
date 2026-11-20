@@ -97,9 +97,7 @@ fn run(config_path: &Path) -> Result<(), MainError> {
 
     // botkit spawns handler work through executor-core; give it a global
     // executor before anything registers.
-    let executor: &'static async_executor::Executor<'static> =
-        Box::leak(Box::new(async_executor::Executor::new()));
-    executor_core::init_global_executor(executor);
+    executor_core::init_global_executor(executor_core::smol::SmolGlobal);
 
     info!("agent: {} {:?}", config.agent.command, config.agent.args);
     let (events_tx, events_rx) = async_channel::unbounded();
@@ -237,7 +235,7 @@ fn run(config_path: &Path) -> Result<(), MainError> {
     ctrlc::set_handler(move || signal.shutdown()).expect("install Ctrl-C handler");
 
     info!("polling for events");
-    futures_lite::future::block_on(executor.run(bot_run)).map_err(MainError::Bot)?;
+    futures_lite::future::block_on(bot_run).map_err(MainError::Bot)?;
 
     // The bot is stopped; kill the watches quietly (their defs persist
     // for the next run) and close the last event sender, which ends the
@@ -246,6 +244,6 @@ fn run(config_path: &Path) -> Result<(), MainError> {
     watchers.shutdown();
     drop(events_tx);
     info!("shutting down agent");
-    futures_lite::future::block_on(executor.run(dispatcher_task));
+    futures_lite::future::block_on(dispatcher_task);
     Ok(())
 }

@@ -249,7 +249,11 @@ impl Tool for SendMessage {
             .into()
     }
 
-    async fn call(&self, args: Self::Arguments) -> aither_core::Result<Self::Res> {
+    async fn call(
+        &self,
+        args: Self::Arguments,
+        _cx: aither_core::llm::tool::ToolContext,
+    ) -> aither_core::Result<Self::Res> {
         let markup = match keyboard(args.buttons) {
             Ok(markup) => markup,
             Err(msg) => return Ok(ToolResult::error(msg)),
@@ -297,7 +301,11 @@ impl Tool for Reply {
             .into()
     }
 
-    async fn call(&self, args: Self::Arguments) -> aither_core::Result<Self::Res> {
+    async fn call(
+        &self,
+        args: Self::Arguments,
+        _cx: aither_core::llm::tool::ToolContext,
+    ) -> aither_core::Result<Self::Res> {
         let markup = match keyboard(args.buttons) {
             Ok(markup) => markup,
             Err(msg) => return Ok(ToolResult::error(msg)),
@@ -347,7 +355,11 @@ impl Tool for SendSticker {
             .into()
     }
 
-    async fn call(&self, args: Self::Arguments) -> aither_core::Result<Self::Res> {
+    async fn call(
+        &self,
+        args: Self::Arguments,
+        _cx: aither_core::llm::tool::ToolContext,
+    ) -> aither_core::Result<Self::Res> {
         let sender = match target(&self.router, args.chat.as_deref()) {
             Ok(sender) => sender,
             Err(result) => return Ok(result),
@@ -417,7 +429,11 @@ impl Tool for SendFile {
             .into()
     }
 
-    async fn call(&self, args: Self::Arguments) -> aither_core::Result<Self::Res> {
+    async fn call(
+        &self,
+        args: Self::Arguments,
+        _cx: aither_core::llm::tool::ToolContext,
+    ) -> aither_core::Result<Self::Res> {
         let caption = args.caption.as_deref();
         let sender = match target(&self.router, args.chat.as_deref()) {
             Ok(sender) => sender,
@@ -471,7 +487,11 @@ impl Tool for React {
             .into()
     }
 
-    async fn call(&self, args: Self::Arguments) -> aither_core::Result<Self::Res> {
+    async fn call(
+        &self,
+        args: Self::Arguments,
+        _cx: aither_core::llm::tool::ToolContext,
+    ) -> aither_core::Result<Self::Res> {
         let sender = match target(&self.router, args.chat.as_deref()) {
             Ok(sender) => sender,
             Err(result) => return Ok(result),
@@ -521,7 +541,11 @@ impl Tool for EditMessage {
             .into()
     }
 
-    async fn call(&self, args: Self::Arguments) -> aither_core::Result<Self::Res> {
+    async fn call(
+        &self,
+        args: Self::Arguments,
+        _cx: aither_core::llm::tool::ToolContext,
+    ) -> aither_core::Result<Self::Res> {
         let sender = match target(&self.router, args.chat.as_deref()) {
             Ok(sender) => sender,
             Err(result) => return Ok(result),
@@ -563,7 +587,11 @@ impl Tool for DeleteMessage {
             .into()
     }
 
-    async fn call(&self, args: Self::Arguments) -> aither_core::Result<Self::Res> {
+    async fn call(
+        &self,
+        args: Self::Arguments,
+        _cx: aither_core::llm::tool::ToolContext,
+    ) -> aither_core::Result<Self::Res> {
         let sender = match target(&self.router, args.chat.as_deref()) {
             Ok(sender) => sender,
             Err(result) => return Ok(result),
@@ -609,7 +637,11 @@ impl Tool for PinMessage {
             .into()
     }
 
-    async fn call(&self, args: Self::Arguments) -> aither_core::Result<Self::Res> {
+    async fn call(
+        &self,
+        args: Self::Arguments,
+        _cx: aither_core::llm::tool::ToolContext,
+    ) -> aither_core::Result<Self::Res> {
         let sender = match target(&self.router, args.chat.as_deref()) {
             Ok(sender) => sender,
             Err(result) => return Ok(result),
@@ -678,7 +710,11 @@ impl Tool for ListStickers {
             .into()
     }
 
-    async fn call(&self, _args: Self::Arguments) -> aither_core::Result<Self::Res> {
+    async fn call(
+        &self,
+        _args: Self::Arguments,
+        _cx: aither_core::llm::tool::ToolContext,
+    ) -> aither_core::Result<Self::Res> {
         let mut entries = load_pack(&self.sticker_dir)?.list_json();
         let library: Vec<serde_json::Value> = self
             .library
@@ -739,7 +775,11 @@ impl Tool for ImportStickerSet {
             .into()
     }
 
-    async fn call(&self, args: Self::Arguments) -> aither_core::Result<Self::Res> {
+    async fn call(
+        &self,
+        args: Self::Arguments,
+        _cx: aither_core::llm::tool::ToolContext,
+    ) -> aither_core::Result<Self::Res> {
         match self.library.import_set(&args.set).await {
             Ok((title, names)) => Ok(ToolResult::text(format!(
                 "imported {} stickers from {title:?} — sendable as {}",
@@ -786,7 +826,11 @@ impl Tool for SaveSticker {
             .into()
     }
 
-    async fn call(&self, args: Self::Arguments) -> aither_core::Result<Self::Res> {
+    async fn call(
+        &self,
+        args: Self::Arguments,
+        _cx: aither_core::llm::tool::ToolContext,
+    ) -> aither_core::Result<Self::Res> {
         let sticker = LibrarySticker {
             file_id: args.file_id,
             emoji: args.emoji,
@@ -827,7 +871,11 @@ impl Tool for ListStickerSets {
             .into()
     }
 
-    async fn call(&self, _args: Self::Arguments) -> aither_core::Result<Self::Res> {
+    async fn call(
+        &self,
+        _args: Self::Arguments,
+        _cx: aither_core::llm::tool::ToolContext,
+    ) -> aither_core::Result<Self::Res> {
         let sets = self.library.list_sets().await;
         let entries: Vec<serde_json::Value> = sets
             .into_iter()
@@ -867,7 +915,11 @@ impl Tool for Restart {
             .into()
     }
 
-    async fn call(&self, _args: Self::Arguments) -> aither_core::Result<Self::Res> {
+    async fn call(
+        &self,
+        _args: Self::Arguments,
+        _cx: aither_core::llm::tool::ToolContext,
+    ) -> aither_core::Result<Self::Res> {
         self.restart
             .try_send(())
             .map_err(|e| aither_core::Error::msg(format!("restart channel rejected: {e}")))?;
@@ -956,7 +1008,11 @@ impl Tool for MessageStatus {
             .into()
     }
 
-    async fn call(&self, args: Self::Arguments) -> aither_core::Result<Self::Res> {
+    async fn call(
+        &self,
+        args: Self::Arguments,
+        _cx: aither_core::llm::tool::ToolContext,
+    ) -> aither_core::Result<Self::Res> {
         let sender = match target(&self.router, args.chat.as_deref()) {
             Ok(sender) => sender,
             Err(result) => return Ok(result),
@@ -1028,7 +1084,11 @@ impl Tool for ChatInfo {
             .into()
     }
 
-    async fn call(&self, args: Self::Arguments) -> aither_core::Result<Self::Res> {
+    async fn call(
+        &self,
+        args: Self::Arguments,
+        _cx: aither_core::llm::tool::ToolContext,
+    ) -> aither_core::Result<Self::Res> {
         // Any sender is a valid platform handle — the lookup isn't bound to
         // the chat it was invoked from; the current chat's sender is used.
         let sender = match target(&self.router, None) {
@@ -1070,7 +1130,11 @@ impl Tool for ListChats {
             .into()
     }
 
-    async fn call(&self, _args: Self::Arguments) -> aither_core::Result<Self::Res> {
+    async fn call(
+        &self,
+        _args: Self::Arguments,
+        _cx: aither_core::llm::tool::ToolContext,
+    ) -> aither_core::Result<Self::Res> {
         let iso = |ts: i64| {
             jiff::Timestamp::from_second(ts)
                 .map(|t| t.to_string())
@@ -1139,7 +1203,11 @@ impl Tool for FetchMessage {
             .into()
     }
 
-    async fn call(&self, args: Self::Arguments) -> aither_core::Result<Self::Res> {
+    async fn call(
+        &self,
+        args: Self::Arguments,
+        _cx: aither_core::llm::tool::ToolContext,
+    ) -> aither_core::Result<Self::Res> {
         // The scratch copy lands in the current chat — `chat` names the
         // source, not the routing target.
         let sender = match target(&self.router, None) {
@@ -1191,7 +1259,11 @@ impl Tool for ChatHistory {
             .into()
     }
 
-    async fn call(&self, args: Self::Arguments) -> aither_core::Result<Self::Res> {
+    async fn call(
+        &self,
+        args: Self::Arguments,
+        _cx: aither_core::llm::tool::ToolContext,
+    ) -> aither_core::Result<Self::Res> {
         let (since, until, limit) = match args.range.bounds() {
             Ok(bounds) => bounds,
             Err(msg) => return Ok(ToolResult::error(msg)),
@@ -1242,7 +1314,11 @@ impl Tool for SearchHistory {
             .into()
     }
 
-    async fn call(&self, args: Self::Arguments) -> aither_core::Result<Self::Res> {
+    async fn call(
+        &self,
+        args: Self::Arguments,
+        _cx: aither_core::llm::tool::ToolContext,
+    ) -> aither_core::Result<Self::Res> {
         let (since, until, limit) = match args.range.bounds() {
             Ok(bounds) => bounds,
             Err(msg) => return Ok(ToolResult::error(msg)),
@@ -1304,7 +1380,11 @@ impl Tool for Watch {
             .into()
     }
 
-    async fn call(&self, args: Self::Arguments) -> aither_core::Result<Self::Res> {
+    async fn call(
+        &self,
+        args: Self::Arguments,
+        _cx: aither_core::llm::tool::ToolContext,
+    ) -> aither_core::Result<Self::Res> {
         let key = match self.router.resolve(args.chat.as_deref()) {
             Ok(key) => key,
             Err(msg) => return Ok(ToolResult::error(msg)),
@@ -1348,7 +1428,11 @@ impl Tool for ListWatches {
             .into()
     }
 
-    async fn call(&self, _args: Self::Arguments) -> aither_core::Result<Self::Res> {
+    async fn call(
+        &self,
+        _args: Self::Arguments,
+        _cx: aither_core::llm::tool::ToolContext,
+    ) -> aither_core::Result<Self::Res> {
         let watches = self.router.shared().watchers.list();
         Ok(ToolResult::text(
             serde_json::to_string(&watches).expect("watches serialize"),
@@ -1383,7 +1467,11 @@ impl Tool for CancelWatch {
             .into()
     }
 
-    async fn call(&self, args: Self::Arguments) -> aither_core::Result<Self::Res> {
+    async fn call(
+        &self,
+        args: Self::Arguments,
+        _cx: aither_core::llm::tool::ToolContext,
+    ) -> aither_core::Result<Self::Res> {
         match self.router.shared().watchers.cancel(&args.id) {
             Ok(()) => Ok(ToolResult::text(format!("watch {} cancelled", args.id))),
             Err(error) => Ok(ToolResult::error(error.to_string())),
@@ -1453,19 +1541,32 @@ mod tests {
         let pack_dir = dir.join("stickers");
         std::fs::create_dir_all(&pack_dir).unwrap();
 
-        let listed = futures_lite::future::block_on(tools.call("list_stickers", "{}")).unwrap();
+        let listed = futures_lite::future::block_on(tools.call(
+            "list_stickers",
+            "{}",
+            aither_core::llm::tool::ToolContext::new(),
+        ))
+        .unwrap();
         assert_eq!(listed.as_text(), Some("[]"));
 
         std::fs::write(pack_dir.join("smug.png"), b"png-bytes").unwrap();
         std::fs::write(pack_dir.join("stickers.toml"), "smug = \"a smug face\"\n").unwrap();
 
-        let listed = futures_lite::future::block_on(tools.call("list_stickers", "{}")).unwrap();
+        let listed = futures_lite::future::block_on(tools.call(
+            "list_stickers",
+            "{}",
+            aither_core::llm::tool::ToolContext::new(),
+        ))
+        .unwrap();
         let text = listed.as_text().unwrap();
         assert!(text.contains("smug"), "new sticker not listed: {text}");
 
-        let sent =
-            futures_lite::future::block_on(tools.call("send_sticker", "{\"name\":\"smug\"}"))
-                .unwrap();
+        let sent = futures_lite::future::block_on(tools.call(
+            "send_sticker",
+            "{\"name\":\"smug\"}",
+            aither_core::llm::tool::ToolContext::new(),
+        ))
+        .unwrap();
         assert!(
             sent.as_text().unwrap().contains("sent sticker"),
             "unexpected result: {}",
@@ -1485,6 +1586,7 @@ mod tests {
         let saved = futures_lite::future::block_on(tools.call(
             "save_sticker",
             "{\"file_id\":\"CAAC_save\",\"name\":\"my_laugh\",\"emoji\":\"😂\"}",
+            aither_core::llm::tool::ToolContext::new(),
         ))
         .unwrap();
         assert!(
@@ -1494,20 +1596,30 @@ mod tests {
         );
 
         // The name now resolves through the library.
-        let sent =
-            futures_lite::future::block_on(tools.call("send_sticker", "{\"name\":\"my_laugh\"}"))
-                .unwrap();
+        let sent = futures_lite::future::block_on(tools.call(
+            "send_sticker",
+            "{\"name\":\"my_laugh\"}",
+            aither_core::llm::tool::ToolContext::new(),
+        ))
+        .unwrap();
         assert!(sent.as_text().unwrap().contains("sent sticker"));
         assert_eq!(out.try_recv().unwrap(), "sticker_id:CAAC_save");
 
         // … and the library lists it.
-        let listed = futures_lite::future::block_on(tools.call("list_stickers", "{}")).unwrap();
+        let listed = futures_lite::future::block_on(tools.call(
+            "list_stickers",
+            "{}",
+            aither_core::llm::tool::ToolContext::new(),
+        ))
+        .unwrap();
         assert!(listed.as_text().unwrap().contains("my_laugh"));
 
         // Duplicate names are refused, not clobbered.
-        let dup = futures_lite::future::block_on(
-            tools.call("save_sticker", "{\"file_id\":\"X\",\"name\":\"my_laugh\"}"),
-        )
+        let dup = futures_lite::future::block_on(tools.call(
+            "save_sticker",
+            "{\"file_id\":\"X\",\"name\":\"my_laugh\"}",
+            aither_core::llm::tool::ToolContext::new(),
+        ))
         .unwrap();
         assert!(dup.as_text().unwrap().contains("already taken"));
     }
@@ -1560,7 +1672,14 @@ mod tests {
         ensure_executor();
         let dir = tempdir("watch");
         let (tools, _router, _out, _keys, _restart, _history) = fixture(&dir);
-        let block = |name, args| futures_lite::future::block_on(tools.call(name, args)).unwrap();
+        let block = |name, args| {
+            futures_lite::future::block_on(tools.call(
+                name,
+                args,
+                aither_core::llm::tool::ToolContext::new(),
+            ))
+            .unwrap()
+        };
 
         let created = block(
             "watch",
@@ -1595,16 +1714,7 @@ mod tests {
     fn ensure_executor() {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
-            let executor: &'static async_executor::Executor<'static> =
-                Box::leak(Box::new(async_executor::Executor::new()));
-            if executor_core::try_init_global_executor(executor).is_err() {
-                return;
-            }
-            for _ in 0..2 {
-                std::thread::spawn(move || {
-                    futures_lite::future::block_on(executor.run(std::future::pending::<()>()));
-                });
-            }
+            let _ = executor_core::try_init_global_executor(executor_core::smol::SmolGlobal);
         });
     }
 
@@ -1614,7 +1724,14 @@ mod tests {
     fn history_reads_back_outbound() {
         let dir = tempdir("history");
         let (tools, _router, _out, _keys, _restart, _history) = fixture(&dir);
-        let block = |name, args| futures_lite::future::block_on(tools.call(name, args)).unwrap();
+        let block = |name, args| {
+            futures_lite::future::block_on(tools.call(
+                name,
+                args,
+                aither_core::llm::tool::ToolContext::new(),
+            ))
+            .unwrap()
+        };
 
         block("send_message", "{\"text\":\"morning all\"}");
         let text = block("history", "{}").as_text().unwrap().to_string();
@@ -1645,7 +1762,14 @@ mod tests {
     fn list_chats_enumerates_known_chats() {
         let dir = tempdir("list-chats");
         let (tools, _router, out, _keys, _restart, _history) = fixture(&dir);
-        let block = |name, args| futures_lite::future::block_on(tools.call(name, args)).unwrap();
+        let block = |name, args| {
+            futures_lite::future::block_on(tools.call(
+                name,
+                args,
+                aither_core::llm::tool::ToolContext::new(),
+            ))
+            .unwrap()
+        };
 
         block("send_message", "{\"chat\":\"123\",\"text\":\"hi\"}");
         let _ = out.try_recv();
@@ -1668,7 +1792,14 @@ mod tests {
     fn message_status_and_deleted_annotation() {
         let dir = tempdir("status");
         let (tools, _router, _out, _keys, _restart, history) = fixture(&dir);
-        let block = |name, args| futures_lite::future::block_on(tools.call(name, args)).unwrap();
+        let block = |name, args| {
+            futures_lite::future::block_on(tools.call(
+                name,
+                args,
+                aither_core::llm::tool::ToolContext::new(),
+            ))
+            .unwrap()
+        };
 
         // The Record platform reports every message alive.
         let text = block("message_status", "{\"message_id\":42}")
@@ -1689,9 +1820,11 @@ mod tests {
     fn send_sticker_by_file_id() {
         let dir = tempdir("sticker-id");
         let (tools, _router, out, _keys, _restart, _history) = fixture(&dir);
-        let result = futures_lite::future::block_on(
-            tools.call("send_sticker", "{\"file_id\":\"CAACAgEAAxk\"}"),
-        )
+        let result = futures_lite::future::block_on(tools.call(
+            "send_sticker",
+            "{\"file_id\":\"CAACAgEAAxk\"}",
+            aither_core::llm::tool::ToolContext::new(),
+        ))
         .unwrap();
         assert!(result.as_text().unwrap().contains("sent sticker"));
         assert_eq!(out.try_recv().unwrap(), "sticker_id:CAACAgEAAxk");
@@ -1706,20 +1839,28 @@ mod tests {
         let result = futures_lite::future::block_on(tools.call(
             "send_file",
             "{\"path\":\"/tmp/report.pdf\",\"caption\":\"here\"}",
+            aither_core::llm::tool::ToolContext::new(),
         ))
         .unwrap();
         assert!(result.as_text().unwrap().contains("sent /tmp/report.pdf"));
         assert_eq!(out.try_recv().unwrap(), "file:/tmp/report.pdf");
 
-        let result = futures_lite::future::block_on(
-            tools.call("send_file", "{\"file_id\":\"BQADBQAD\",\"kind\":\"video\"}"),
-        )
+        let result = futures_lite::future::block_on(tools.call(
+            "send_file",
+            "{\"file_id\":\"BQADBQAD\",\"kind\":\"video\"}",
+            aither_core::llm::tool::ToolContext::new(),
+        ))
         .unwrap();
         assert!(result.as_text().unwrap().contains("sent media"));
         assert_eq!(out.try_recv().unwrap(), "file_id:Video:BQADBQAD");
 
         // Neither `path` nor `file_id` is a usage error, not a panic.
-        let result = futures_lite::future::block_on(tools.call("send_file", "{}")).unwrap();
+        let result = futures_lite::future::block_on(tools.call(
+            "send_file",
+            "{}",
+            aither_core::llm::tool::ToolContext::new(),
+        ))
+        .unwrap();
         assert!(result.is_error());
     }
 
@@ -1728,7 +1869,14 @@ mod tests {
     fn message_management_tools() {
         let dir = tempdir("manage");
         let (tools, _router, out, _keys, _restart, _history) = fixture(&dir);
-        let block = |args| futures_lite::future::block_on(tools.call("react", args)).unwrap();
+        let block = |args| {
+            futures_lite::future::block_on(tools.call(
+                "react",
+                args,
+                aither_core::llm::tool::ToolContext::new(),
+            ))
+            .unwrap()
+        };
 
         let result = block("{\"message_id\":9,\"emoji\":\"👍\"}");
         assert!(result.as_text().unwrap().contains("reacted 👍"));
@@ -1738,29 +1886,38 @@ mod tests {
         assert!(result.as_text().unwrap().contains("cleared"));
         assert_eq!(out.try_recv().unwrap(), "react:9:");
 
-        let result = futures_lite::future::block_on(
-            tools.call("edit_message", "{\"message_id\":9,\"text\":\"done\"}"),
-        )
+        let result = futures_lite::future::block_on(tools.call(
+            "edit_message",
+            "{\"message_id\":9,\"text\":\"done\"}",
+            aither_core::llm::tool::ToolContext::new(),
+        ))
         .unwrap();
         assert!(result.as_text().unwrap().contains("edited"));
         assert_eq!(out.try_recv().unwrap(), "edit:9:done");
 
-        let result =
-            futures_lite::future::block_on(tools.call("delete_message", "{\"message_id\":9}"))
-                .unwrap();
+        let result = futures_lite::future::block_on(tools.call(
+            "delete_message",
+            "{\"message_id\":9}",
+            aither_core::llm::tool::ToolContext::new(),
+        ))
+        .unwrap();
         assert!(result.as_text().unwrap().contains("deleted"));
         assert_eq!(out.try_recv().unwrap(), "delete:9");
 
-        let result = futures_lite::future::block_on(
-            tools.call("pin_message", "{\"message_id\":9,\"notify\":false}"),
-        )
+        let result = futures_lite::future::block_on(tools.call(
+            "pin_message",
+            "{\"message_id\":9,\"notify\":false}",
+            aither_core::llm::tool::ToolContext::new(),
+        ))
         .unwrap();
         assert!(result.as_text().unwrap().contains("pinned"));
         assert_eq!(out.try_recv().unwrap(), "pin:9:false");
 
-        let result = futures_lite::future::block_on(
-            tools.call("pin_message", "{\"message_id\":9,\"unpin\":true}"),
-        )
+        let result = futures_lite::future::block_on(tools.call(
+            "pin_message",
+            "{\"message_id\":9,\"unpin\":true}",
+            aither_core::llm::tool::ToolContext::new(),
+        ))
         .unwrap();
         assert!(result.as_text().unwrap().contains("unpinned"));
         assert_eq!(out.try_recv().unwrap(), "pin:9:true");
@@ -1772,7 +1929,12 @@ mod tests {
     fn restart_signals_channel() {
         let dir = tempdir("restart");
         let (tools, _router, _out, _keys, restart_rx, _history) = fixture(&dir);
-        let result = futures_lite::future::block_on(tools.call("restart", "{}")).unwrap();
+        let result = futures_lite::future::block_on(tools.call(
+            "restart",
+            "{}",
+            aither_core::llm::tool::ToolContext::new(),
+        ))
+        .unwrap();
         assert_eq!(
             result.as_text(),
             Some("restart scheduled — end your turn normally")
@@ -1787,10 +1949,7 @@ mod tests {
         let dir = tempdir("buttons");
         let (tools, _router, out, _keys, _restart, _history) = fixture(&dir);
 
-        let result = futures_lite::future::block_on(tools.call(
-            "send_message",
-            r#"{"text":"pick","buttons":[[{"text":"yes","data":"y"},{"text":"no","data":"n"}],[{"text":"link","url":"https://example.com"}]]}"#,
-        ))
+        let result = futures_lite::future::block_on(tools.call("send_message", r#"{"text":"pick","buttons":[[{"text":"yes","data":"y"},{"text":"no","data":"n"}],[{"text":"link","url":"https://example.com"}]]}"#, aither_core::llm::tool::ToolContext::new()))
         .unwrap();
         assert!(!result.is_error());
         assert_eq!(out.try_recv().unwrap(), "send:pick");
@@ -1799,6 +1958,7 @@ mod tests {
         let result = futures_lite::future::block_on(tools.call(
             "send_message",
             r#"{"text":"x","buttons":[[{"text":"bad","data":"d","url":"https://example.com"}]]}"#,
+            aither_core::llm::tool::ToolContext::new(),
         ))
         .unwrap();
         assert!(result.is_error());
@@ -1807,6 +1967,7 @@ mod tests {
         let result = futures_lite::future::block_on(tools.call(
             "send_message",
             r#"{"text":"x","buttons":[[{"text":"bad"}]]}"#,
+            aither_core::llm::tool::ToolContext::new(),
         ))
         .unwrap();
         assert!(result.is_error());
@@ -1819,7 +1980,14 @@ mod tests {
     fn chat_arg_routes() {
         let dir = tempdir("route");
         let (tools, router, out, keys, _restart, _history) = fixture(&dir);
-        let block = |name, args| futures_lite::future::block_on(tools.call(name, args)).unwrap();
+        let block = |name, args| {
+            futures_lite::future::block_on(tools.call(
+                name,
+                args,
+                aither_core::llm::tool::ToolContext::new(),
+            ))
+            .unwrap()
+        };
 
         // Default: the turn's current chat ("0") gets the sender.
         let result = block("send_message", "{\"text\":\"home\"}");

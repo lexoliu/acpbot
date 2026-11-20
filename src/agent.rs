@@ -23,10 +23,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::error::{AgentError, SenderError};
+use aither_acp::domain::{AudioContent, ImageContent, Open, StopReason};
+use aither_acp::rpc::RpcError;
 use aither_acp::{
-    AcpClient, AgentCapabilities, AudioContent, ClientError, ContentBlock, ImageContent,
-    PromptCapabilities, PromptParams, PromptResult, SessionLoadParams, SessionNewParams,
-    SessionResumeParams, SessionSetConfigOptionParams, SessionSetModeParams, TextContent,
+    Client, ClientError, ClientSession, ContentBlock, Implementation, SessionId, TurnOutcome,
 };
 use async_channel::{Receiver, Sender as ChanSender};
 use base64::Engine as _;
@@ -35,7 +35,6 @@ use tracing::{debug, error, info, warn};
 
 use crate::chat::{ChatEvent, ChatKey};
 use crate::config::{AgentConfig, AgentIsolation};
-use crate::handler::BotClientHandler;
 use crate::history::{History, history_path};
 use crate::mcpserver;
 use crate::registry::{ChatRecord, ChatRegistry};
@@ -551,6 +550,7 @@ impl Dispatcher {
         let last_action = Arc::new(AtomicU64::new(crate::sender::epoch_ms()));
         let (restart_tx, restart_rx) = async_channel::unbounded();
         let (blocked_tx, blocked_rx) = async_channel::unbounded();
+        let (died_tx, died_rx) = async_channel::unbounded();
         let actor = ChatActor {
             shared: self.shared.clone(),
             router: Arc::new(ChatRouter::new(
@@ -560,18 +560,21 @@ impl Dispatcher {
                 self.platform,
             )),
             client: None,
+            session: None,
             session_id,
             mcp_endpoint: None,
             browser: self.browser.clone(),
             runtime: None,
             child: None,
-            prompt_caps: PromptCapabilities::default(),
+            prompt_caps: MediaCaps::default(),
             compact_supported: Arc::new(AtomicBool::new(false)),
             inflight: load_inflight(&self.shared.data_dir),
             session_turns: 0,
             spoke_rx,
             blocked_rx,
             blocked_tx,
+            died_rx,
+            died_tx,
             last_action,
             activity: Arc::new(crate::handler::Activity::default()),
             restart_tx,
@@ -616,6 +619,14 @@ async fn wait_event(rx: &Receiver<ChatEvent>, idle: Duration) -> Waited {
     .await
 }
 
+/// Media content the agent accepts in prompts, read off the negotiated
+/// `initialize` capabilities — an absent marker means text only.
+#[derive(Debug, Default, Clone, Copy)]
+struct MediaCaps {
+    image: bool,
+    audio: bool,
+}
+
 /// Ends a turn's typing task when dropped.
 struct TurnTyping(async_channel::Sender<()>);
 
@@ -632,7 +643,10 @@ struct ChatActor {
     /// the chat whose events triggered the in-flight turn. Shared with
     /// every tool the chat MCP endpoint serves.
     router: Arc<ChatRouter>,
-    client: Option<AcpClient<BotClientHandler>>,
+    client: Option<Client>,
+    /// The live ACP session the actor prompts — always the fresh session
+    /// opened after any recovery handoff.
+    session: Option<ClientSession>,
     /// A session awaiting handoff — handed in by the dispatcher or held
     /// across a mid-run respawn. Restored only to extract `CONTINUITY.md`,
     /// then replaced by a fresh session; never resumed into duty.
@@ -654,9 +668,13 @@ struct ChatActor {
     /// Fires when the session reports a command-tool call on the shared
     /// thread — `run_command` & friends belong inside subagents, so the
     /// turn is cancelled and re-prompted. The sender half is cloned into
-    /// each respawned `BotClientHandler`.
+    /// each spawned session watcher.
     blocked_rx: Receiver<String>,
     blocked_tx: ChanSender<String>,
+    /// Fires once when the agent's JSON-RPC connection ends — how a dead
+    /// child is told apart from a prompt the agent genuinely rejected.
+    died_rx: Receiver<()>,
+    died_tx: ChanSender<()>,
     /// Epoch ms of the agent's last outbound action — every sender writes
     /// it through `spoke`; the nudge watchdog reads it to measure silence.
     last_action: Arc<AtomicU64>,
@@ -675,7 +693,7 @@ struct ChatActor {
     restart_rx: Receiver<()>,
     /// Content types the agent declared at `initialize` — gates whether
     /// media reaches it as `image`/`audio` blocks or only an `inbox/` path.
-    prompt_caps: PromptCapabilities,
+    prompt_caps: MediaCaps,
     /// Set by the session's `available_commands_update` — `true` when the
     /// harness handles a `compact` command, so idle compaction is a local
     /// operation rather than text the model would answer in the chat.
@@ -876,8 +894,7 @@ impl ChatActor {
     /// `/compact` is devin's spelling; a harness without it would treat
     /// the prompt as ordinary text and could answer in the chat.
     async fn compact(&mut self) -> Result<(), AgentError> {
-        let (Some(client), Some(session_id)) = (self.client.clone(), self.session_id.clone())
-        else {
+        let Some(session) = self.session.clone() else {
             return Ok(());
         };
         if !self.compact_supported.load(Ordering::Relaxed) {
@@ -885,17 +902,10 @@ impl ChatActor {
             return Ok(());
         }
         info!("idle; compacting session");
-        let result = client
-            .prompt(PromptParams::new(
-                session_id.clone(),
-                vec![ContentBlock::Text(TextContent {
-                    text: "/compact".to_string(),
-                    annotations: None,
-                    meta: None,
-                })],
-            ))
+        let outcome = session
+            .prompt_run(vec![ContentBlock::text("/compact")])
             .await?;
-        debug!(stop = ?result.stop_reason, "idle compaction done");
+        debug!(?outcome, "idle compaction done");
         Ok(())
     }
 
@@ -977,21 +987,13 @@ impl ChatActor {
         };
         let mut prompt = Vec::new();
         if replayed > 0 {
-            prompt.push(ContentBlock::Text(TextContent {
-                text: format!(
-                    "[acpbot] the daemon restarted mid-turn — the first {replayed} \
-                     event(s) below already reached you before the interruption and \
-                     may be partly answered; check `history` before re-answering."
-                ),
-                annotations: None,
-                meta: None,
-            }));
+            prompt.push(ContentBlock::text(format!(
+                "[acpbot] the daemon restarted mid-turn — the first {replayed} \
+                 event(s) below already reached you before the interruption and \
+                 may be partly answered; check `history` before re-answering."
+            )));
         }
-        prompt.push(ContentBlock::Text(TextContent {
-            text,
-            annotations: None,
-            meta: None,
-        }));
+        prompt.push(ContentBlock::text(text));
         for file in batch.iter().flat_map(ChatEvent::files) {
             let is_image = self.prompt_caps.image && file.mime.starts_with("image/");
             let is_audio = self.prompt_caps.audio && file.mime.starts_with("audio/");
@@ -1011,6 +1013,7 @@ impl ChatActor {
                     mime_type,
                     annotations: None,
                     meta: None,
+                    extra: BTreeMap::new(),
                 })
             } else {
                 ContentBlock::Audio(AudioContent {
@@ -1018,6 +1021,7 @@ impl ChatActor {
                     mime_type,
                     annotations: None,
                     meta: None,
+                    extra: BTreeMap::new(),
                 })
             });
         }
@@ -1030,11 +1034,10 @@ impl ChatActor {
         let spoke_at_start = self.last_action.load(Ordering::Relaxed);
         let wants_answer = batch.iter().any(wants_answer);
 
-        let client = self.client.clone().expect("ensure_ready ran");
-        let session_id = self.session_id.clone().expect("ensure_ready ran");
+        let session = self.session.clone().expect("ensure_ready ran");
 
         let mut end = match self
-            .prompt_with_nudges(&client, &session_id, prompt.clone(), rx, pending)
+            .prompt_with_nudges(&session, prompt.clone(), rx, pending)
             .await
         {
             // A daemon shutdown interrupts the prompt wait — but the agent
@@ -1045,21 +1048,23 @@ impl ChatActor {
             // The user said stop: the turn is already cancelled and its
             // remaining work discarded — a quiet end, not a failure.
             Ok(end) => end,
-            // A dead child fails every pending request with `Closed`: respawn
-            // once, reload the session, and retry the prompt once.
-            Err(ClientError::Closed { .. }) => {
-                warn!("agent process died; respawning");
+            // A dead child fails every pending request — the connection's
+            // death signal is what tells that apart from a prompt the
+            // agent genuinely rejected. Respawn once, reload the session,
+            // and retry the prompt once.
+            Err(error)
+                if matches!(error, ClientError::PeerClosed { .. })
+                    || self.died_rx.try_recv().is_ok() =>
+            {
+                warn!(%error, "agent process died; respawning");
                 self.client = None;
+                self.session = None;
                 if let Some(mut child) = self.child.take() {
                     let _ = child.kill();
                 }
                 self.ensure_ready().await?;
-                let client = self.client.clone().expect("ensure_ready ran");
-                let session_id = self.session_id.clone().expect("ensure_ready ran");
-                match self
-                    .prompt_with_nudges(&client, &session_id, prompt, rx, pending)
-                    .await
-                {
+                let session = self.session.clone().expect("ensure_ready ran");
+                match self.prompt_with_nudges(&session, prompt, rx, pending).await {
                     Ok(PromptEnd::Shutdown) => return Ok(()),
                     Ok(end) => end,
                     Err(error) => return Err(error.into()),
@@ -1067,8 +1072,8 @@ impl ChatActor {
             }
             Err(error) => return Err(error.into()),
         };
-        if let PromptEnd::Done(result) = &end {
-            debug_turn_end(result);
+        if let PromptEnd::Done(stop) = &end {
+            debug_turn_end(stop);
         }
 
         // Two failure shapes re-prompt with a nudge naming the failure,
@@ -1097,23 +1102,15 @@ impl ChatActor {
                 _ => break,
             };
             retries -= 1;
-            let nudge = vec![ContentBlock::Text(TextContent {
-                text: nudge_text,
-                annotations: None,
-                meta: None,
-            })];
-            let (Some(client), Some(session_id)) = (self.client.clone(), self.session_id.clone())
-            else {
+            let nudge = vec![ContentBlock::text(nudge_text)];
+            let Some(session) = self.session.clone() else {
                 break;
             };
-            match self
-                .prompt_with_nudges(&client, &session_id, nudge, rx, pending)
-                .await
-            {
+            match self.prompt_with_nudges(&session, nudge, rx, pending).await {
                 Ok(PromptEnd::Shutdown) => return Ok(()),
                 Ok(next) => {
-                    if let PromptEnd::Done(result) = &next {
-                        debug_turn_end(result);
+                    if let PromptEnd::Done(stop) = &next {
+                        debug_turn_end(stop);
                     }
                     end = next;
                 }
@@ -1146,6 +1143,7 @@ impl ChatActor {
         if restart {
             info!("agent requested restart");
             self.client = None;
+            self.session = None;
             if let Some(mut child) = self.child.take() {
                 let _ = child.kill();
             }
@@ -1195,11 +1193,10 @@ impl ChatActor {
     /// activity clock.
     async fn cancel_turn(
         &self,
-        client: &AcpClient<BotClientHandler>,
-        session_id: &str,
-        prompt: &mut Pin<Box<dyn Future<Output = Result<PromptResult, ClientError>> + Send + '_>>,
+        session: &ClientSession,
+        prompt: &mut Pin<Box<dyn Future<Output = TurnOutcome> + Send>>,
     ) {
-        cancel_and_settle(client, session_id, prompt).await;
+        cancel_and_settle(session, prompt).await;
         self.activity.clear_tools();
         self.activity
             .last_update
@@ -1220,16 +1217,18 @@ impl ChatActor {
     /// channel, same FIFO order.
     async fn prompt_with_nudges(
         &mut self,
-        client: &AcpClient<BotClientHandler>,
-        session_id: &str,
+        session: &ClientSession,
         content: Vec<ContentBlock>,
         rx: &Receiver<ChatEvent>,
         pending: &mut Vec<ChatEvent>,
     ) -> Result<PromptEnd, ClientError> {
         let nudge_after = self.shared.agent.nudge_after();
-        let mut prompt: Pin<
-            Box<dyn Future<Output = Result<PromptResult, ClientError>> + Send + '_>,
-        > = Box::pin(client.prompt(PromptParams::new(session_id, content)));
+        // The turn's events are already folded into the session's
+        // broadcast stream — `watch_session` keeps the watchdog fed — so
+        // only the finish future needs polling here.
+        let mut turn = session.prompt(content)?;
+        let mut prompt: Pin<Box<dyn Future<Output = TurnOutcome> + Send>> =
+            Box::pin(async move { turn.finish().await });
         // Blocked-tool reports from a dead turn are stale; this prompt's
         // calls start reporting once it is in flight.
         while self.blocked_rx.try_recv().is_ok() {}
@@ -1238,7 +1237,7 @@ impl ChatActor {
         let mut events_open = true;
         loop {
             enum Race {
-                Done(Result<PromptResult, ClientError>),
+                Done(TurnOutcome),
                 Shutdown,
                 Tick,
                 Event(Box<ChatEvent>),
@@ -1284,11 +1283,23 @@ impl ChatActor {
             )
             .await;
             match race {
-                Race::Done(result) => return result.map(PromptEnd::Done),
+                Race::Done(outcome) => {
+                    return Ok(match outcome {
+                        TurnOutcome::Finished { stop_reason, .. } => PromptEnd::Done(stop_reason),
+                        // The agent ended our prompt `cancelled` on its
+                        // own — a quiet end, same as a delivered stop.
+                        TurnOutcome::Cancelled => {
+                            PromptEnd::Done(Some(Open::Known(StopReason::Cancelled)))
+                        }
+                        TurnOutcome::Rejected(error) => {
+                            return Err(ClientError::Rejected(error));
+                        }
+                    });
+                }
                 // Cancel before yielding the session: the shutdown handoff
                 // prompt can't run while this turn is still in flight.
                 Race::Shutdown => {
-                    self.cancel_turn(client, session_id, &mut prompt).await;
+                    self.cancel_turn(session, &mut prompt).await;
                     return Ok(PromptEnd::Shutdown);
                 }
                 Race::EventsClosed => events_open = false,
@@ -1303,7 +1314,7 @@ impl ChatActor {
                         .is_some_and(|current| current == key_of(&event));
                     if event.is_stop() && owns_turn {
                         info!(chat = %key_of(&event), "user said stop; cancelling turn");
-                        self.cancel_turn(client, session_id, &mut prompt).await;
+                        self.cancel_turn(session, &mut prompt).await;
                         return Ok(PromptEnd::Stopped);
                     }
                     // Pulled but not yet prompted — journal it so a crash
@@ -1328,7 +1339,7 @@ impl ChatActor {
                         busy, generating,
                         "agent silent past the nudge deadline; interrupting"
                     );
-                    self.cancel_turn(client, session_id, &mut prompt).await;
+                    self.cancel_turn(session, &mut prompt).await;
                     // The nudged turn gets a fresh silence budget — it must
                     // still speak within `nudge_after` or be interrupted
                     // again.
@@ -1341,21 +1352,15 @@ impl ChatActor {
                     } else {
                         nudge_event_text(self.router.current().as_ref())
                     };
-                    prompt = Box::pin(client.prompt(PromptParams::new(
-                        session_id,
-                        vec![ContentBlock::Text(TextContent {
-                            text,
-                            annotations: None,
-                            meta: None,
-                        })],
-                    )));
+                    let mut nudge_turn = session.prompt(vec![ContentBlock::text(text)])?;
+                    prompt = Box::pin(async move { nudge_turn.finish().await });
                 }
                 Race::Blocked(tool) => {
                     warn!(
                         chat = ?self.router.current(),
                         tool, "command tool on the shared thread; cancelling turn"
                     );
-                    self.cancel_turn(client, session_id, &mut prompt).await;
+                    self.cancel_turn(session, &mut prompt).await;
                     // Reports can still land while the cancellation
                     // settles — drop them so the caller's re-prompt
                     // doesn't trip over a dead turn's calls.
@@ -1400,26 +1405,39 @@ impl ChatActor {
         // The new session will re-advertise its commands; don't trust a
         // previous process's `compact` in the meantime.
         self.compact_supported.store(false, Ordering::Relaxed);
-        let handler = BotClientHandler::new(
-            self.transcript_path(),
-            self.compact_supported.clone(),
-            self.blocked_tx.clone(),
-            self.activity.clone(),
-        );
+        let builder = Client::builder(Implementation::new("acpbot", env!("CARGO_PKG_VERSION")))
+            .permissions(|request| async move { crate::handler::permission_decision(&request) });
         let spawned = self
             .runtime
             .as_ref()
             .expect("created above")
-            .spawn_agent(&self.shared.agent, &cwd, handler)
+            .spawn_agent(&self.shared.agent, &cwd, builder)
             .await?;
-        let client = spawned.client;
         self.child = spawned.child;
-        executor_core::spawn(spawned.connection).detach();
+        let died = self.died_tx.clone();
+        executor_core::spawn(async move {
+            spawned.connection.await;
+            let _ = died.try_send(());
+        })
+        .detach();
+        // The previous incarnation's death signal is spent; only this
+        // connection's end counts from here.
+        while self.died_rx.try_recv().is_ok() {}
+        let client = spawned.client;
 
-        let init = client.initialize().await?;
-        self.prompt_caps = init.agent_capabilities.prompt_capabilities.clone();
+        // `connect`/`spawn` already ran `initialize`: the negotiated
+        // capabilities are what the builder reported.
+        self.prompt_caps = client
+            .agent_capabilities()
+            .session
+            .as_ref()
+            .and_then(|caps| caps.prompt.as_ref())
+            .map_or_else(MediaCaps::default, |prompt| MediaCaps {
+                image: prompt.image.is_some(),
+                audio: prompt.audio.is_some(),
+            });
         info!(
-            agent = init.agent_info.as_ref().map_or("?", |i| i.name.as_str()),
+            agent = client.agent_info().map_or("?", |info| info.name.as_str()),
             image = self.prompt_caps.image,
             audio = self.prompt_caps.audio,
             "agent initialized"
@@ -1431,52 +1449,51 @@ impl ChatActor {
         // it go: this daemon never resumes a session into active duty, so
         // the harness or model is free to change between incarnations.
         if let Some(old) = self.session_id.take()
-            && let Some(sid) = self
-                .restore_session(&client, &init.agent_capabilities, &old, &cwd)
-                .await
+            && let Some(old_session) = self.restore_session(&client, &old, &cwd).await
         {
-            if self.write_continuity(&client, &sid).await {
-                info!(session = sid, "recovered continuity from previous session");
+            if self.write_continuity(&old_session).await {
+                info!(session = %old_session.id(), "recovered continuity from previous session");
                 let _ = self.shared.session_updates.try_send(SessionUpdate::Closed);
             } else {
                 warn!(
-                    session = sid,
+                    session = %old_session.id(),
                     "continuity recovery failed; starting fresh anyway"
                 );
             }
         }
 
-        let session_id = self.new_session(&client, &cwd).await?;
+        let session = self.new_session(&client, &cwd).await?;
+        let session_id = session.id().to_string();
 
-        if let Err(error) = client
-            .set_mode(SessionSetModeParams::new(
-                session_id.clone(),
-                self.shared.agent.mode.clone(),
-            ))
-            .await
-        {
+        if let Err(error) = session.set_mode(self.shared.agent.mode.clone()).await {
             warn!(%error, "set_mode failed");
         }
-        if let Err(error) = client
-            .set_config_option(SessionSetConfigOptionParams::new(
-                session_id.clone(),
-                "model",
-                self.shared.agent.model.clone(),
-            ))
-            .await
-        {
-            warn!(%error, "set_config_option(model) failed");
+        if let Err(error) = session.set_model(self.shared.agent.model.clone()).await {
+            warn!(%error, "set_model failed");
         }
+
+        // The session's event stream feeds the transcript, the watchdog's
+        // activity signals, `compact` discovery, and the blocked-tool
+        // flag — the handler half of the old demux, per session now.
+        executor_core::spawn(crate::handler::watch_session(
+            session.clone(),
+            self.transcript_path(),
+            self.compact_supported.clone(),
+            self.blocked_tx.clone(),
+            self.activity.clone(),
+        ))
+        .detach();
 
         self.session_id = Some(session_id.clone());
         self.session_turns = 0;
         let _ = self
             .shared
             .session_updates
-            .try_send(SessionUpdate::Established(session_id.clone()));
+            .try_send(SessionUpdate::Established(session_id));
         // Bootstrap memory goes in as the first turn — a plain prompt, so
         // the same file carries across harnesses and models.
-        self.inject_continuity(&client, &session_id).await;
+        self.inject_continuity(&session).await;
+        self.session = Some(session);
         self.client = Some(client);
         Ok(())
     }
@@ -1548,50 +1565,50 @@ impl ChatActor {
     }
 
     /// Restore `sid` inside the agent, preferring `session/resume` (context
-    /// restored without a history replay) over `session/load` when the
-    /// capability is advertised. Returns `None` when neither method is
-    /// supported or the attempt fails.
+    /// restored without a history replay) over `session/load`. A capability
+    /// the agent lacks reports `Unsupported`; anything else is logged and
+    /// falls through to the next attempt. Returns `None` when neither
+    /// method is supported or the attempt fails.
     async fn restore_session(
         &self,
-        client: &AcpClient<BotClientHandler>,
-        caps: &AgentCapabilities,
+        client: &Client,
         sid: &str,
         cwd: &Path,
-    ) -> Option<String> {
-        if caps.session_capabilities.resume.is_some() {
-            match client
-                .resume_session(SessionResumeParams::new(sid, cwd))
-                .await
-            {
-                Ok(_) => {
-                    info!(session = sid, "resumed session");
-                    return Some(sid.to_string());
-                }
-                Err(error) => warn!(session = sid, %error,
-                                    "session/resume failed"),
+    ) -> Option<ClientSession> {
+        match client
+            .resume_session(SessionId::from(sid), cwd)
+            .no_replay()
+            .open()
+            .await
+        {
+            Ok(session) => {
+                info!(session = sid, "resumed session");
+                return Some(session);
+            }
+            Err(ClientError::Unsupported(_)) => {}
+            Err(error) => warn!(session = sid, %error, "session/resume failed"),
+        }
+        match client
+            .resume_session(SessionId::from(sid), cwd)
+            .replay_from_start()
+            .open()
+            .await
+        {
+            Ok(session) => {
+                info!(session = sid, "loaded session");
+                Some(session)
+            }
+            Err(error) => {
+                warn!(session = sid, %error, "session/load failed");
+                None
             }
         }
-        if caps.load_session {
-            match client.load_session(SessionLoadParams::new(sid, cwd)).await {
-                Ok(_) => {
-                    info!(session = sid, "loaded session");
-                    return Some(sid.to_string());
-                }
-                Err(error) => warn!(session = sid, %error,
-                                    "session/load failed"),
-            }
-        }
-        None
     }
 
-    async fn new_session(
-        &self,
-        client: &AcpClient<BotClientHandler>,
-        cwd: &Path,
-    ) -> Result<String, AgentError> {
-        let result = client.new_session(SessionNewParams::new(cwd)).await?;
-        info!(session = %result.session_id, "session created");
-        Ok(result.session_id)
+    async fn new_session(&self, client: &Client, cwd: &Path) -> Result<ClientSession, AgentError> {
+        let session = client.new_session(cwd).open().await?;
+        info!(session = %session.id(), "session created");
+        Ok(session)
     }
 
     /// End the actor: give the live session its one chance to write
@@ -1608,8 +1625,8 @@ impl ChatActor {
             // (one just recovered into place) with an empty incarnation's
             // note. It still counts as closed: nothing exists to recover.
             true
-        } else if let (Some(client), Some(sid)) = (self.client.clone(), self.session_id.clone()) {
-            self.write_continuity(&client, &sid).await
+        } else if let Some(session) = self.session.clone() {
+            self.write_continuity(&session).await
         } else {
             false
         };
@@ -1619,6 +1636,7 @@ impl ChatActor {
             let _ = self.shared.session_updates.try_send(SessionUpdate::Closed);
         }
         self.client = None;
+        self.session = None;
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
         }
@@ -1630,11 +1648,7 @@ impl ChatActor {
     /// distilled state the note should carry — then a prompt that writes
     /// `CONTINUITY.md`. `true` only when the file was (re)written by this
     /// call; anything less keeps the session resumable for a retry.
-    async fn write_continuity(
-        &self,
-        client: &AcpClient<BotClientHandler>,
-        session_id: &str,
-    ) -> bool {
+    async fn write_continuity(&self, session: &ClientSession) -> bool {
         let path = self.cwd().join(CONTINUITY_FILE);
         let before = std::fs::metadata(&path)
             .and_then(|m| m.modified())
@@ -1642,17 +1656,13 @@ impl ChatActor {
 
         if self.compact_supported.load(Ordering::Relaxed)
             && let Err(error) = self
-                .maintenance_prompt(client, session_id, "/compact".to_string())
+                .maintenance_prompt(session, "/compact".to_string())
                 .await
         {
             warn!(%error, "handoff compaction failed");
         }
         if let Err(error) = self
-            .maintenance_prompt(
-                client,
-                session_id,
-                format!("{HANDOFF_PROMPT}{}", path.display()),
-            )
+            .maintenance_prompt(session, format!("{HANDOFF_PROMPT}{}", path.display()))
             .await
         {
             warn!(%error, "handoff prompt failed");
@@ -1670,7 +1680,7 @@ impl ChatActor {
     /// Feed the previous incarnation's `CONTINUITY.md` into a fresh
     /// session as its first turn. Best-effort: a failed or timed-out
     /// inject is a memory-less start, not a failed spawn.
-    async fn inject_continuity(&self, client: &AcpClient<BotClientHandler>, session_id: &str) {
+    async fn inject_continuity(&self, session: &ClientSession) {
         let Ok(text) = std::fs::read_to_string(self.cwd().join(CONTINUITY_FILE)) else {
             return;
         };
@@ -1679,7 +1689,7 @@ impl ChatActor {
         }
         info!("injecting continuity summary into new session");
         let prompt = format!("{INJECT_PROMPT}\n\n{text}{}", self.recent_outbound());
-        if let Err(error) = self.maintenance_prompt(client, session_id, prompt).await {
+        if let Err(error) = self.maintenance_prompt(session, prompt).await {
             warn!(%error, "continuity inject failed");
         }
     }
@@ -1735,22 +1745,14 @@ impl ChatActor {
     /// is cancelled so its wire request cannot bleed into later work.
     async fn maintenance_prompt(
         &self,
-        client: &AcpClient<BotClientHandler>,
-        session_id: &str,
+        session: &ClientSession,
         text: String,
     ) -> Result<(), ClientError> {
-        let mut prompt: Pin<
-            Box<dyn Future<Output = Result<PromptResult, ClientError>> + Send + '_>,
-        > = Box::pin(client.prompt(PromptParams::new(
-            session_id,
-            vec![ContentBlock::Text(TextContent {
-                text,
-                annotations: None,
-                meta: None,
-            })],
-        )));
+        let mut turn = session.prompt(vec![ContentBlock::text(text)])?;
+        let mut prompt: Pin<Box<dyn Future<Output = TurnOutcome> + Send>> =
+            Box::pin(async move { turn.finish().await });
         enum Outcome {
-            Done(Result<PromptResult, ClientError>),
+            Done(TurnOutcome),
             TimedOut,
         }
         match futures_lite::future::or(async { Outcome::Done(prompt.as_mut().await) }, async {
@@ -1759,12 +1761,13 @@ impl ChatActor {
         })
         .await
         {
-            Outcome::Done(result) => result.map(|_| ()),
+            Outcome::Done(TurnOutcome::Finished { .. } | TurnOutcome::Cancelled) => Ok(()),
+            Outcome::Done(TurnOutcome::Rejected(error)) => Err(ClientError::Rejected(error)),
             Outcome::TimedOut => {
-                self.cancel_turn(client, session_id, &mut prompt).await;
-                Err(ClientError::Transport(format!(
+                self.cancel_turn(session, &mut prompt).await;
+                Err(ClientError::Transport(RpcError::internal_error(format!(
                     "maintenance prompt timed out after {HANDOFF_TIMEOUT:?}"
-                )))
+                ))))
             }
         }
     }
@@ -1844,14 +1847,14 @@ async fn typing_task(
     }
 }
 
-fn debug_turn_end(result: &PromptResult) {
-    debug!(stop_reason = ?result.stop_reason, "turn ended");
+fn debug_turn_end(stop_reason: &Option<Open<StopReason>>) {
+    debug!(?stop_reason, "turn ended");
 }
 
 /// How a nudge-watched prompt ended.
 enum PromptEnd {
-    /// The agent finished a turn normally.
-    Done(PromptResult),
+    /// The agent finished a turn normally, carrying its stop reason.
+    Done(Option<Open<StopReason>>),
     /// The daemon's shutdown channel fired mid-turn.
     Shutdown,
     /// A `stop` event cancelled the turn mid-flight.
@@ -1864,11 +1867,10 @@ enum PromptEnd {
 /// Cancel the in-flight prompt and give the wire a bounded moment to
 /// settle its response — a wedged agent must not hold the actor forever.
 async fn cancel_and_settle(
-    client: &AcpClient<BotClientHandler>,
-    session_id: &str,
-    prompt: &mut Pin<Box<dyn Future<Output = Result<PromptResult, ClientError>> + Send + '_>>,
+    session: &ClientSession,
+    prompt: &mut Pin<Box<dyn Future<Output = TurnOutcome> + Send>>,
 ) {
-    if let Err(error) = client.cancel(session_id).await {
+    if let Err(error) = session.cancel().await {
         debug!(%error, "cancel failed — turn may have ended");
     }
     futures_lite::future::or(
@@ -2492,18 +2494,12 @@ pub(super) mod tests {
     use std::time::{Duration, Instant};
 
     /// The global executor can only be installed once per process; both
-    /// ignored e2e tests share it.
+    /// ignored e2e tests share it. `SmolGlobal` keeps its own worker pool,
+    /// so installing it is all the setup needed.
     fn ensure_executor() {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
-            let executor: &'static async_executor::Executor<'static> =
-                Box::leak(Box::new(async_executor::Executor::new()));
-            executor_core::init_global_executor(executor);
-            for _ in 0..4 {
-                std::thread::spawn(move || {
-                    futures_lite::future::block_on(executor.run(std::future::pending::<()>()));
-                });
-            }
+            executor_core::init_global_executor(executor_core::smol::SmolGlobal);
         });
     }
 

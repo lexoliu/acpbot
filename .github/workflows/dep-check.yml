@@ -28,6 +28,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: lexoliu/heel
+          ref: bd552e75734cb0eaa9c8f5ffd92b092c797e6085 # heel 0.3.x — the API acpbot is written against
           path: native-sandbox
 
       - name: Detect project type

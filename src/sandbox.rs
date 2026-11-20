@@ -19,8 +19,8 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
 use crate::error::SandboxError;
-use aither_acp::AcpClient;
-use aither_mcp::transport::StreamTransport;
+use aither_acp::client::{Client, ClientBuilder, Connection};
+use aither_acp::rpc::Lines;
 use async_channel::Sender as ChanSender;
 use futures_lite::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use heel::{
@@ -31,7 +31,6 @@ use serde::Deserialize;
 use tracing::warn;
 
 use crate::config::{AgentConfig, AgentIsolation, DockerIsolation, GrantAccess, NativeIsolation};
-use crate::handler::BotClientHandler;
 use crate::mcpserver::ChatEndpoint;
 
 /// The IPC command the sandboxed `mcp-bridge` invokes for each JSON-RPC line.
@@ -114,10 +113,10 @@ pub struct DockerRuntime {
 
 /// A freshly spawned agent process.
 pub struct SpawnedAgent {
-    /// The connected ACP client.
-    pub client: AcpClient<BotClientHandler>,
+    /// The connected ACP client — `initialize` already ran.
+    pub client: Client,
     /// The connection driver; spawn it on the executor.
-    pub connection: Pin<Box<dyn Future<Output = ()> + Send>>,
+    pub connection: Connection,
     /// The sandboxed child handle, kept so a respawn can kill the process
     /// explicitly rather than waiting for the pipes to close. `None` for
     /// bare and docker spawns, whose connection driver owns the process.
@@ -149,15 +148,17 @@ impl AgentRuntime {
         }
     }
 
-    /// Spawn the agent and connect over its stdio pipes.
+    /// Spawn the agent and connect over its stdio pipes. `builder` carries
+    /// the client's declared info and request handlers; each runtime hands
+    /// it the transport its spawn produced.
     pub async fn spawn_agent(
         &self,
         agent: &AgentConfig,
         cwd: &Path,
-        handler: BotClientHandler,
+        builder: ClientBuilder,
     ) -> Result<SpawnedAgent, SandboxError> {
         match self {
-            Self::Bare => spawn_stdio(&agent.command, agent.args.clone(), cwd, handler),
+            Self::Bare => spawn_stdio(&agent.command, agent.args.clone(), cwd, builder).await,
             Self::Docker(docker) => {
                 let args = docker
                     .run_args
@@ -166,9 +167,9 @@ impl AgentRuntime {
                     .chain(std::iter::once(agent.command.clone()))
                     .chain(agent.args.iter().cloned())
                     .collect();
-                spawn_stdio("docker", args, cwd, handler)
+                spawn_stdio("docker", args, cwd, builder).await
             }
-            Self::Native(native) => native.spawn(agent, cwd, handler).await,
+            Self::Native(native) => native.spawn(agent, cwd, builder).await,
         }
     }
 }
@@ -251,7 +252,7 @@ impl NativeRuntime {
         &self,
         agent: &AgentConfig,
         cwd: &Path,
-        handler: BotClientHandler,
+        builder: ClientBuilder,
     ) -> Result<SpawnedAgent, SandboxError> {
         let home = dirs::home_dir().ok_or(SandboxError::NoHome)?;
         let mut child = self
@@ -277,14 +278,14 @@ impl NativeRuntime {
         let stdin = child
             .take_stdin()
             .ok_or(SandboxError::MissingPipe("stdin"))?;
-        let transport = StreamTransport::new(
-            BufReader::new(async_fs::File::from(stdout)),
-            async_fs::File::from(stdin),
-        );
-        let (client, connection) = AcpClient::connect(transport, handler);
+        let transport = Lines::new(async_fs::File::from(stdout), async_fs::File::from(stdin));
+        let (client, connection) = builder
+            .connect(transport)
+            .await
+            .map_err(|error| SandboxError::Other(format!("connect to agent failed: {error}")))?;
         Ok(SpawnedAgent {
             client,
-            connection: Box::pin(connection),
+            connection,
             child: Some(child),
         })
     }
@@ -349,24 +350,19 @@ impl DockerRuntime {
 
 /// Spawn through `async_process` — used directly for `none` and as the
 /// `docker run` wrapper for `docker`.
-fn spawn_stdio(
+async fn spawn_stdio(
     program: &str,
     args: Vec<String>,
     cwd: &Path,
-    handler: BotClientHandler,
+    builder: ClientBuilder,
 ) -> Result<SpawnedAgent, SandboxError> {
-    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let (client, connection) = AcpClient::spawn(
-        program,
-        &arg_refs,
-        std::iter::empty::<(String, String)>(),
-        cwd.to_path_buf(),
-        handler,
-    )
-    .map_err(|e| SandboxError::Other(format!("failed to spawn {program}: {e}")))?;
+    let (client, connection) = builder
+        .spawn(program, &args, &[], cwd)
+        .await
+        .map_err(|e| SandboxError::Other(format!("failed to spawn {program}: {e}")))?;
     Ok(SpawnedAgent {
         client,
-        connection: Box::pin(connection),
+        connection,
         child: None,
     })
 }
