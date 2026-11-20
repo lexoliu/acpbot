@@ -573,7 +573,11 @@ macro_rules! browser_tool {
             fn description(&self) -> std::borrow::Cow<'static, str> {
                 $desc.into()
             }
-            async fn call(&self, args: Self::Arguments) -> aither_core::Result<Self::Res> {
+            async fn call(
+                &self,
+                args: Self::Arguments,
+                _cx: aither_core::llm::tool::ToolContext,
+            ) -> aither_core::Result<Self::Res> {
                 let mut guard = match self.browser.live().await {
                     Ok(guard) => guard,
                     Err(error) => {
@@ -1242,7 +1246,11 @@ impl Tool for CloseBrowser {
          profile persists). The next browser_* call relaunches fresh."
             .into()
     }
-    async fn call(&self, _args: Self::Arguments) -> aither_core::Result<Self::Res> {
+    async fn call(
+        &self,
+        _args: Self::Arguments,
+        _cx: aither_core::llm::tool::ToolContext,
+    ) -> aither_core::Result<Self::Res> {
         let mut state = self.browser.inner.lock().await;
         *state = State::Down; // dropping Live kills the child
         Ok(ToolResult::text(
@@ -1291,16 +1299,7 @@ mod tests {
     fn ensure_executor() {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
-            let executor: &'static async_executor::Executor<'static> =
-                Box::leak(Box::new(async_executor::Executor::new()));
-            if executor_core::try_init_global_executor(executor).is_err() {
-                return;
-            }
-            for _ in 0..2 {
-                std::thread::spawn(move || {
-                    futures_lite::future::block_on(executor.run(std::future::pending::<()>()));
-                });
-            }
+            let _ = executor_core::try_init_global_executor(executor_core::smol::SmolGlobal);
         });
     }
 
@@ -1318,14 +1317,22 @@ mod tests {
             browser.register_into(&mut tools);
 
             let result = tools
-                .call("browser_navigate", r#"{"url":"https://example.com"}"#)
+                .call(
+                    "browser_navigate",
+                    r#"{"url":"https://example.com"}"#,
+                    aither_core::llm::tool::ToolContext::new(),
+                )
                 .await
                 .expect("navigate call");
             let text = result.as_text().unwrap_or_default().to_string();
             assert!(text.contains("Example Domain"), "got: {text}");
 
             let result = tools
-                .call("browser_snapshot", r#"{}"#)
+                .call(
+                    "browser_snapshot",
+                    r#"{}"#,
+                    aither_core::llm::tool::ToolContext::new(),
+                )
                 .await
                 .expect("snapshot call");
             let text = result.as_text().unwrap_or_default().to_string();
@@ -1335,13 +1342,18 @@ mod tests {
                 .call(
                     "browser_evaluate",
                     r#"{"expression":"navigator.webdriver"}"#,
+                    aither_core::llm::tool::ToolContext::new(),
                 )
                 .await
                 .expect("evaluate call");
             assert_eq!(result.as_text().unwrap_or_default(), "false");
 
             let result = tools
-                .call("browser_screenshot", r#"{}"#)
+                .call(
+                    "browser_screenshot",
+                    r#"{}"#,
+                    aither_core::llm::tool::ToolContext::new(),
+                )
                 .await
                 .expect("screenshot call");
             let _ = result;

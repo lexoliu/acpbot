@@ -594,16 +594,7 @@ mod tests {
     fn ensure_executor() {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
-            let executor: &'static async_executor::Executor<'static> =
-                Box::leak(Box::new(async_executor::Executor::new()));
-            if executor_core::try_init_global_executor(executor).is_err() {
-                return;
-            }
-            for _ in 0..2 {
-                std::thread::spawn(move || {
-                    futures_lite::future::block_on(executor.run(std::future::pending::<()>()));
-                });
-            }
+            let _ = executor_core::try_init_global_executor(executor_core::smol::SmolGlobal);
         });
     }
 

@@ -18,9 +18,9 @@ cargo build
 ./target/debug/acpbot run --config acpbot.toml
 ```
 
-`executor_core::spawn` requires a global executor; `main` installs a leaked
-`async_executor::Executor` before anything registers. Tests that spawn tasks
-must do the same (see `ensure_executor` in test modules).
+`executor_core::spawn` requires a global executor; `main` installs
+`executor_core::smol::SmolGlobal` before anything registers. Tests that spawn
+tasks must do the same (see `ensure_executor` in test modules).
 
 ## Architecture
 
@@ -156,7 +156,8 @@ subagents, the main turn only talks and dispatches. It is enforced two
 ways — `request_permission` denies any command-shaped call in-band when
 the session mode routes decisions to the client (the model sees a refused
 call inside the same turn and can delegate), and as a backstop for modes
-like `bypass` that resolve permissions internally, `BotClientHandler`
+like `bypass` that resolve permissions internally, the `handler.rs`
+session-event watcher
 flags any tool call with `kind: Execute` the moment one starts on the
 shared thread — the agy bridge classifies `run_command` & friends,
 devin's `exec` reports it natively, and a `MAIN_BLOCKED_TOOLS` name list

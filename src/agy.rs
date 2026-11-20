@@ -17,21 +17,17 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 
-use aither_acp::{
-    AgentCapabilities, ContentBlock, ContentChunk, Implementation, InitializeResult,
-    McpCapabilities, PROTOCOL_VERSION, PromptCapabilities, PromptParams, PromptResult,
-    SessionCancelParams, SessionCapabilities, SessionCloseCapabilities, SessionCloseParams,
-    SessionCloseResult, SessionConfigValue, SessionDeleteParams, SessionDeleteResult, SessionInfo,
-    SessionListCapabilities, SessionListResult, SessionLoadParams, SessionLoadResult,
-    SessionNewParams, SessionNewResult, SessionNotification, SessionResumeCapabilities,
-    SessionResumeParams, SessionResumeResult, SessionSetConfigOptionParams,
-    SessionSetConfigOptionResult, SessionSetModeParams, SessionSetModeResult, SessionUpdate,
-    StopReason, TextContent, ToolCall, ToolCallStatus, ToolCallUpdate, ToolKind,
+use aither_acp::domain::ids::{ConfigId, ToolCallId};
+use aither_acp::domain::{
+    AgentCapabilities, ConfigOption, ConfigValue, ContentBlock, Implementation, Open, Patch,
+    SessionCaps, SessionId, SessionInfo, SessionListParams, SessionPage, SessionSetupParams,
+    SessionUpdate, StopReason, ToolCallStatus, ToolCallUpdate, ToolKind,
 };
-use aither_mcp::protocol::{
-    JsonRpcError, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
+use aither_acp::rpc::RpcError;
+use aither_acp::server::{
+    MessageStream, PendingPrompt, PromptError, ResumeRequest, Server, ServerError, Session,
+    SessionContext, SessionHost, ToolCallHandle, Turn,
 };
-use aither_mcp::transport::{BidirectionalTransport, StdioTransport, Transport};
 use futures_lite::future::or;
 use tracing::{debug, warn};
 
@@ -54,295 +50,211 @@ fn conversation_map_path(cwd: &Path) -> PathBuf {
     cwd.join(".agy-bridge.json")
 }
 
-/// The bridge's whole state: sessions acpbot opened plus the child handle
-/// a `session/cancel` kills mid-turn.
-struct Bridge {
-    sessions: HashMap<String, AgySession>,
-    /// The running turn's agy child per session, so `session/cancel` —
-    /// a notification, not a request — can kill it while the prompt
-    /// request is still being serviced.
-    running: HashMap<String, Arc<Mutex<Option<Child>>>>,
+/// The bridge's host: opens sessions for `session/new`, rebinds them for
+/// `session/load`/`session/resume`, and tracks the live set for
+/// `session/list`.
+#[derive(Default)]
+struct AgyHost {
+    /// `session id → cwd` for every live session — `close`/`delete` remove.
+    live: Arc<Mutex<HashMap<SessionId, PathBuf>>>,
 }
 
 /// One ACP session backed by an agy conversation.
 struct AgySession {
+    /// The ACP id the server assigned — keys the conversation map.
+    id: SessionId,
     /// The session's working directory — agy inherits it as its cwd.
     cwd: PathBuf,
-    /// `--model` override from `session/set_config_option("model")`.
-    model: Option<String>,
-    /// `--mode` override from `session/set_mode` (accept-edits/plan only).
-    mode: Option<String>,
+    /// `--model` override from a `model` config set.
+    model: Mutex<Option<String>>,
+    /// `--mode` override from a mode set (accept-edits/plan only).
+    mode: Mutex<Option<String>>,
     /// The agy conversation backing this session — known once the first
     /// turn's `init` event reports it.
-    conversation: Option<String>,
+    conversation: Mutex<Option<String>>,
+    /// The running turn's agy child, so `session/close` — and the turn's
+    /// own `cancelled` — can kill it while the prompt is in flight.
+    running: Arc<Mutex<Option<Child>>>,
+    /// Back-reference into the host's live map so `close` unregisters.
+    live: Arc<Mutex<HashMap<SessionId, PathBuf>>>,
 }
 
-/// Run the bridge: read ACP JSON-RPC from stdin until EOF.
+/// Run the bridge: serve ACP on stdio until the transport ends.
 pub fn run() -> Result<(), BridgeError> {
-    futures_lite::future::block_on(serve()).map_err(BridgeError::from)
-}
-
-async fn serve() -> Result<(), aither_mcp::protocol::McpError> {
-    let mut transport = StdioTransport::new();
-    let mut bridge = Bridge {
-        sessions: HashMap::new(),
-        running: HashMap::new(),
-    };
-    loop {
-        match transport.recv().await? {
-            Some(JsonRpcMessage::Request(req)) => {
-                let response = bridge.handle_request(req, &mut transport).await;
-                transport.respond(response).await?;
-            }
-            Some(JsonRpcMessage::Notification(notif)) => bridge.handle_notification(&notif),
-            Some(JsonRpcMessage::Response(_)) => {}
-            None => break,
-        }
-    }
-    // stdin closed: kill any in-flight agy child so none outlive the daemon.
-    for child in bridge.running.values() {
-        if let Some(mut c) = child.lock().expect("running").take() {
-            let _ = c.kill();
-        }
-    }
+    futures_lite::future::block_on(async {
+        let (_peer, serve) = Server::new(
+            AgyHost::default(),
+            Implementation::new("acpbot agy-bridge", env!("CARGO_PKG_VERSION")),
+        )
+        .serve_stdio();
+        serve.await;
+    });
     Ok(())
 }
 
-impl Bridge {
-    /// Notifications: only `session/cancel` does anything — kill the turn's
-    /// agy child; the turn loop notices the closed stream and answers the
-    /// outstanding prompt request with `stop_reason: cancelled`.
-    fn handle_notification(&self, notif: &JsonRpcNotification) {
-        if notif.method == "session/cancel"
-            && let Some(Ok(SessionCancelParams { session_id, .. })) =
-                notif.params.clone().map(serde_json::from_value)
-            && let Some(child) = self.running.get(&session_id)
-            && let Some(mut c) = child.lock().expect("running").take()
-        {
-            let _ = c.kill();
-        }
-    }
-
-    async fn handle_request(
-        &mut self,
-        req: JsonRpcRequest,
-        transport: &mut StdioTransport,
-    ) -> JsonRpcResponse {
-        match req.method.as_str() {
-            "initialize" => JsonRpcResponse::success(req.id, initialize_result()),
-            "session/new" => self.session_new(req),
-            "session/load" => self.session_restore(req, false),
-            "session/resume" => self.session_restore(req, true),
-            "session/set_mode" => self.session_set_mode(req),
-            "session/set_config_option" => self.session_set_config(req),
-            "session/prompt" => self.session_prompt(req, transport).await,
-            "session/list" => self.session_list(req),
-            "session/close" | "session/delete" => self.session_end(req),
-            method => JsonRpcResponse::error(req.id, JsonRpcError::method_not_found(method)),
-        }
-    }
-
-    /// `session/new`: register the chat MCP endpoint from the session's
-    /// `.devin/mcp_config.json` with agy's global registry, then record a
-    /// session keyed by a fresh id. agy itself spawns lazily at the first
-    /// prompt so `set_mode`/`set_config_option` land before it does.
-    fn session_new(&mut self, req: JsonRpcRequest) -> JsonRpcResponse {
-        let params = match parse_params::<SessionNewParams>(&req) {
-            Ok(p) => p,
-            Err(resp) => return *resp,
-        };
-        mirror_mcp_servers(&params.cwd);
-        let session_id = new_id();
-        self.sessions.insert(
-            session_id.clone(),
-            AgySession {
-                cwd: params.cwd,
-                model: None,
-                mode: None,
-                conversation: None,
-            },
-        );
-        JsonRpcResponse::success(
-            req.id,
-            SessionNewResult {
-                session_id,
-                ..SessionNewResult::default()
-            },
-        )
-    }
-
-    /// `session/load` and `session/resume`: rebind an acp session id to its
-    /// recorded agy conversation so a recovery handoff can still ask the
-    /// old session for its summary.
-    fn session_restore(&mut self, req: JsonRpcRequest, resume: bool) -> JsonRpcResponse {
-        let (session_id, cwd) = if resume {
-            match parse_params::<SessionResumeParams>(&req) {
-                Ok(p) => (p.session_id, p.cwd),
-                Err(resp) => return *resp,
-            }
-        } else {
-            match parse_params::<SessionLoadParams>(&req) {
-                Ok(p) => (p.session_id, p.cwd),
-                Err(resp) => return *resp,
-            }
-        };
-        let map = conversation_map(&cwd);
-        let Some(conversation) = map.get(&session_id).cloned() else {
-            return JsonRpcResponse::error(
-                req.id,
-                JsonRpcError::invalid_params(format!("unknown session: {session_id}")),
-            );
-        };
+impl AgyHost {
+    /// Register a session and build it.
+    fn register(
+        &self,
+        session_id: &SessionId,
+        cwd: PathBuf,
+        conversation: Option<String>,
+    ) -> AgySession {
         mirror_mcp_servers(&cwd);
-        self.sessions.insert(
-            session_id,
-            AgySession {
-                cwd,
-                model: None,
-                mode: None,
-                conversation: Some(conversation),
-            },
-        );
-        if resume {
-            JsonRpcResponse::success(req.id, SessionResumeResult::default())
-        } else {
-            JsonRpcResponse::success(req.id, SessionLoadResult::default())
+        self.live
+            .lock()
+            .expect("live")
+            .insert(session_id.clone(), cwd.clone());
+        AgySession {
+            id: session_id.clone(),
+            cwd,
+            model: Mutex::new(None),
+            mode: Mutex::new(None),
+            conversation: Mutex::new(conversation),
+            running: Arc::new(Mutex::new(None)),
+            live: self.live.clone(),
+        }
+    }
+}
+
+impl SessionHost for AgyHost {
+    type Session = AgySession;
+
+    /// The v1 capability surface the daemon's client probes: text-only
+    /// prompts, `loadSession`, and resume/close/list under
+    /// `sessionCapabilities` — encoded through the caps `extra` keys the
+    /// v1 codec reads.
+    fn capabilities(&self) -> AgentCapabilities {
+        AgentCapabilities {
+            session: Some(SessionCaps {
+                prompt: Some(aither_acp::domain::PromptCaps::default()),
+                delete: Some(aither_acp::domain::EmptyObject),
+                extra: BTreeMap::from([
+                    ("loadSession".to_string(), serde_json::json!(true)),
+                    ("resume".to_string(), serde_json::json!({})),
+                    ("close".to_string(), serde_json::json!({})),
+                    ("list".to_string(), serde_json::json!({})),
+                ]),
+                ..SessionCaps::default()
+            }),
+            ..AgentCapabilities::default()
         }
     }
 
-    /// `session/set_mode`: acpbot's modes are devin-flavored (`bypass`);
-    /// only agy's own `accept-edits`/`plan` become a `--mode` flag —
-    /// everything else is accepted and ignored.
-    fn session_set_mode(&mut self, req: JsonRpcRequest) -> JsonRpcResponse {
-        match parse_params::<SessionSetModeParams>(&req) {
-            Ok(p) => {
-                if let Some(session) = self.sessions.get_mut(&p.session_id) {
-                    session.mode = Some(p.mode_id);
-                }
-                JsonRpcResponse::success(req.id, SessionSetModeResult::default())
-            }
-            Err(resp) => *resp,
-        }
+    /// `session/new`: mirror the chat MCP endpoint into agy's global
+    /// registry and open a session; agy itself spawns lazily at the first
+    /// prompt so `set_mode`/`set_config_option` land before it does.
+    async fn new_session(
+        &self,
+        params: SessionSetupParams,
+        cx: &SessionContext,
+    ) -> Result<AgySession, ServerError> {
+        Ok(self.register(cx.session_id(), params.cwd, None))
     }
 
-    /// `session/set_config_option`: `model` becomes `--model`; other keys
-    /// are accepted and ignored.
-    fn session_set_config(&mut self, req: JsonRpcRequest) -> JsonRpcResponse {
-        match parse_params::<SessionSetConfigOptionParams>(&req) {
-            Ok(p) => {
-                if let Some(session) = self.sessions.get_mut(&p.session_id)
-                    && p.config_id == "model"
-                    && let SessionConfigValue::Select { value, .. } = p.value
-                {
-                    session.model = Some(value);
-                }
-                JsonRpcResponse::success(req.id, SessionSetConfigOptionResult::default())
-            }
-            Err(resp) => *resp,
-        }
+    /// `session/resume` (and v1 `session/load`/`session/fork` behind it):
+    /// rebind an acp session id to its recorded agy conversation so a
+    /// recovery handoff can still ask the old session for its summary.
+    async fn resume_session(
+        &self,
+        req: ResumeRequest,
+        cx: &SessionContext,
+    ) -> Result<AgySession, ServerError> {
+        let cwd = req.params.setup.cwd.clone();
+        let map = conversation_map(&cwd);
+        let session_id = req.session_id().clone();
+        let Some(conversation) = map.get(session_id.as_str()).cloned() else {
+            return Err(ServerError::Rpc(RpcError::invalid_params(format!(
+                "unknown session: {session_id}"
+            ))));
+        };
+        let _ = cx;
+        Ok(self.register(&session_id, cwd, Some(conversation)))
     }
 
-    fn session_list(&self, req: JsonRpcRequest) -> JsonRpcResponse {
+    /// `session/list`: the live sessions this bridge still serves.
+    async fn list_sessions(&self, _params: SessionListParams) -> Result<SessionPage, RpcError> {
         let sessions = self
-            .sessions
+            .live
+            .lock()
+            .expect("live")
             .iter()
-            .map(|(id, s)| SessionInfo {
+            .map(|(id, cwd)| SessionInfo {
                 session_id: id.clone(),
-                cwd: s.cwd.clone(),
-                additional_directories: Vec::new(),
+                cwd: cwd.clone(),
                 title: None,
                 updated_at: None,
                 meta: None,
                 extra: BTreeMap::new(),
             })
             .collect();
-        JsonRpcResponse::success(
-            req.id,
-            SessionListResult {
-                sessions,
-                ..SessionListResult::default()
-            },
-        )
+        Ok(SessionPage {
+            sessions,
+            ..SessionPage::default()
+        })
     }
 
-    /// `session/close` + `session/delete`: end the session — kill its agy
-    /// child if a turn is running, drop the state. The conversation map is
-    /// kept: a later `session/load` may still need the recovery handle.
-    fn session_end(&mut self, req: JsonRpcRequest) -> JsonRpcResponse {
-        let session_id = if req.method == "session/delete" {
-            match parse_params::<SessionDeleteParams>(&req) {
-                Ok(p) => p.session_id,
-                Err(resp) => return *resp,
+    /// `session/delete`: drop the session — the conversation map stays so
+    /// a later `session/load` may still need the recovery handle.
+    async fn delete_session(&self, session_id: &SessionId) -> Result<(), RpcError> {
+        self.live.lock().expect("live").remove(session_id);
+        Ok(())
+    }
+}
+
+impl Session for AgySession {
+    /// `session/set_config_option` (v1 `session/set_mode` decodes to the
+    /// mode-category option): `model` becomes `--model`; a mode becomes
+    /// `--mode` when agy knows it — everything else is accepted and
+    /// ignored.
+    async fn set_config(
+        &self,
+        id: &ConfigId,
+        value: ConfigValue,
+        _cx: &SessionContext,
+    ) -> Result<Vec<ConfigOption>, RpcError> {
+        if let ConfigValue::Id(by_id) = value {
+            if id.as_str() == "model" {
+                *self.model.lock().expect("model") = Some(by_id.value.into_string());
+            } else {
+                *self.mode.lock().expect("mode") = Some(by_id.value.into_string());
             }
-        } else {
-            match parse_params::<SessionCloseParams>(&req) {
-                Ok(p) => p.session_id,
-                Err(resp) => return *resp,
-            }
-        };
-        if let Some(child) = self.running.remove(&session_id)
-            && let Some(mut c) = child.lock().expect("running").take()
-        {
-            let _ = c.kill();
         }
-        if self.sessions.remove(&session_id).is_none() {
-            return JsonRpcResponse::error(
-                req.id,
-                JsonRpcError::invalid_params(format!("session not found: {session_id}")),
-            );
-        }
-        if req.method == "session/delete" {
-            JsonRpcResponse::success(req.id, SessionDeleteResult::default())
-        } else {
-            JsonRpcResponse::success(req.id, SessionCloseResult::default())
-        }
+        Ok(Vec::new())
     }
 
     /// `session/prompt`: spawn `agy` for this one turn, feed it the prompt
     /// as a single `user` stream-json event, translate its `step_update`
-    /// stream into `session/update` notifications, and answer with the
-    /// turn's stop reason when `result` arrives.
-    ///
-    /// While the turn runs, stdin keeps being read so `session/cancel`
-    /// lands mid-turn; other requests queue and are answered after.
-    async fn session_prompt(
-        &mut self,
-        req: JsonRpcRequest,
-        transport: &mut StdioTransport,
-    ) -> JsonRpcResponse {
-        let params = match parse_params::<PromptParams>(&req) {
-            Ok(p) => p,
-            Err(resp) => return *resp,
-        };
-        // The session leaves the map for the turn's duration so `self`
-        // stays free for transport I/O; it goes back once the turn ends.
-        let Some(mut session) = self.sessions.remove(&params.session_id) else {
-            return JsonRpcResponse::error(
-                req.id,
-                JsonRpcError::invalid_params(format!("session not found: {}", params.session_id)),
-            );
-        };
-
-        let stop = self.run_turn(transport, &mut session, &params).await;
-        self.sessions.insert(params.session_id.clone(), session);
-
-        JsonRpcResponse::success(
-            req.id,
-            PromptResult {
-                stop_reason: stop,
-                meta: None,
-            },
-        )
+    /// stream into `session/update`s, and answer with the turn's stop
+    /// reason when `result` arrives.
+    async fn prompt(
+        &self,
+        pending: PendingPrompt,
+        cx: &SessionContext,
+    ) -> Result<StopReason, PromptError> {
+        let text = prompt_text(pending.content());
+        let session_id = cx.session_id().clone();
+        let turn = pending
+            .accept()
+            .await
+            .map_err(|e| PromptError::Failed(e.into_inner()))?;
+        Ok(self.run_turn(&turn, &session_id, &text).await)
     }
 
-    /// One turn of `agy` for `session`, streaming updates to `transport`.
-    /// Returns the turn's stop reason.
-    async fn run_turn(
-        &mut self,
-        transport: &mut StdioTransport,
-        session: &mut AgySession,
-        params: &PromptParams,
-    ) -> StopReason {
+    /// Kills any in-flight agy child and drops the session from the live
+    /// map — the conversation map on disk stays for a later load.
+    async fn close(&self) {
+        if let Some(mut child) = self.running.lock().expect("running").take() {
+            let _ = child.kill();
+        }
+        self.live.lock().expect("live").remove(&self.id);
+    }
+}
+
+impl AgySession {
+    /// One turn of `agy`, streaming updates through `turn`. Returns the
+    /// turn's stop reason.
+    async fn run_turn(&self, turn: &Turn, session_id: &SessionId, text: &str) -> StopReason {
         let mut args = vec![
             "--output-format".to_string(),
             "stream-json".to_string(),
@@ -350,22 +262,22 @@ impl Bridge {
             "stream-json".to_string(),
             "--dangerously-skip-permissions".to_string(),
         ];
-        if let Some(model) = &session.model {
-            args.extend(["--model".to_string(), model.clone()]);
+        if let Some(model) = self.model.lock().expect("model").clone() {
+            args.extend(["--model".to_string(), model]);
         }
-        if let Some(mode) = &session.mode
+        if let Some(mode) = self.mode.lock().expect("mode").clone()
             && matches!(mode.as_str(), "accept-edits" | "plan")
         {
-            args.extend(["--mode".to_string(), mode.clone()]);
+            args.extend(["--mode".to_string(), mode]);
         }
-        if let Some(conversation) = &session.conversation {
-            args.extend(["--conversation".to_string(), conversation.clone()]);
+        if let Some(conversation) = self.conversation.lock().expect("conversation").clone() {
+            args.extend(["--conversation".to_string(), conversation]);
         }
         args.extend(["--print".to_string(), String::new()]);
 
         let mut child = match Command::new(agy_bin())
             .args(&args)
-            .current_dir(&session.cwd)
+            .current_dir(&self.cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -380,7 +292,6 @@ impl Bridge {
 
         // The whole turn is one line; closing stdin is what starts it —
         // agy reads stream-json input to EOF before running the turn.
-        let text = prompt_text(&params.prompt);
         if let Some(mut stdin) = child.stdin.take() {
             let line = serde_json::json!({"event":"user","message":{"content": text}});
             if let Err(error) = writeln!(stdin, "{line}") {
@@ -392,8 +303,8 @@ impl Bridge {
         drop(child.stdin.take());
 
         // agy's stdout is a blocking pipe; a reader thread turns it into a
-        // channel so the turn loop can race it against client input. `None`
-        // on the channel marks end-of-stream.
+        // channel so the turn loop can race it against the turn's cancel.
+        // `None` on the channel marks end-of-stream.
         let (lines_tx, lines_rx) = async_channel::unbounded::<Option<String>>();
         let stdout = child.stdout.take().expect("piped");
         std::thread::spawn(move || {
@@ -414,29 +325,41 @@ impl Bridge {
             let _ = lines_tx.send_blocking(None);
         });
 
-        let cell = Arc::new(Mutex::new(Some(child)));
-        self.running.insert(params.session_id.clone(), cell.clone());
-        let mut cancelled = false;
-        let mut deferred = Vec::new();
+        *self.running.lock().expect("running") = Some(child);
 
         /// Which side of the turn's `or` produced a value.
         enum Step {
             /// One stdout line, or `None` at end-of-stream.
             Line(Option<String>),
-            /// A client message arrived mid-turn.
-            Client(std::result::Result<Option<JsonRpcMessage>, aither_mcp::protocol::McpError>),
+            /// `session/cancel` (or a close) hit the turn.
+            Cancel,
         }
 
+        let mut tools: HashMap<String, ToolCallHandle> = HashMap::new();
+        let mut message: Option<MessageStream> = None;
+        let mut thought: Option<MessageStream> = None;
+        let mut cancelled = false;
         let stop = loop {
             let step = or(
                 async { Step::Line(lines_rx.recv().await.unwrap_or(None)) },
-                async { Step::Client(transport.recv().await) },
+                async {
+                    turn.cancelled().await;
+                    Step::Cancel
+                },
             )
             .await;
             match step {
                 Step::Line(Some(line)) => {
-                    if let Some(stop) =
-                        agy_line(transport, session, &params.session_id, &line).await
+                    if let Some(stop) = self
+                        .agy_line(
+                            turn,
+                            session_id,
+                            &mut tools,
+                            &mut message,
+                            &mut thought,
+                            &line,
+                        )
+                        .await
                     {
                         break stop;
                     }
@@ -450,29 +373,18 @@ impl Bridge {
                         StopReason::Error
                     };
                 }
-                Step::Client(Ok(Some(JsonRpcMessage::Notification(notif)))) => {
-                    if notif.method == "session/cancel" {
-                        cancelled = true;
-                        if let Some(mut c) = cell.lock().expect("running").take() {
-                            let _ = c.kill();
-                        }
-                    }
-                }
-                Step::Client(Ok(Some(msg))) => deferred.push(msg),
-                // The daemon went away mid-turn — kill the child; nobody
-                // will read the response.
-                Step::Client(Ok(None) | Err(_)) => {
-                    if let Some(mut c) = cell.lock().expect("running").take() {
+                Step::Cancel => {
+                    cancelled = true;
+                    if let Some(mut c) = self.running.lock().expect("running").take() {
                         let _ = c.kill();
                     }
-                    break StopReason::Cancelled;
                 }
             }
         };
 
         // Reap the child — normally it has already exited after `result`;
         // bound the wait so a lingering process cannot hang the loop.
-        if let Some(mut c) = cell.lock().expect("running").take() {
+        if let Some(mut c) = self.running.lock().expect("running").take() {
             for _ in 0..200 {
                 match c.try_wait() {
                     Ok(Some(_)) | Err(_) => break,
@@ -484,178 +396,141 @@ impl Bridge {
                 let _ = c.wait();
             }
         }
-        self.running.remove(&params.session_id);
-
-        for msg in deferred {
-            match msg {
-                JsonRpcMessage::Request(req) => {
-                    let response = Box::pin(self.handle_request(req, transport)).await;
-                    if transport.respond(response).await.is_err() {
-                        break;
-                    }
-                }
-                JsonRpcMessage::Notification(notif) => self.handle_notification(&notif),
-                JsonRpcMessage::Response(_) => {}
-            }
-        }
 
         stop
     }
-}
 
-/// Translate one agy NDJSON line into `session/update` notifications.
-/// Returns the turn's stop reason once the `result` event arrives.
-async fn agy_line(
-    transport: &mut StdioTransport,
-    session: &mut AgySession,
-    session_id: &str,
-    line: &str,
-) -> Option<StopReason> {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-        debug!("unparsed agy line: {}", &line[..line.len().min(200)]);
-        return None;
-    };
-    match value.get("event").and_then(|e| e.as_str()) {
-        Some("init") => {
-            // First sight of the conversation id: bind it so later turns —
-            // and a later `session/load` after a crash — resume the same
-            // conversation.
-            if let Some(conversation_id) = value.get("conversation_id").and_then(|c| c.as_str())
-                && session.conversation.as_deref() != Some(conversation_id)
-            {
-                session.conversation = Some(conversation_id.to_string());
-                let mut map = conversation_map(&session.cwd);
-                map.insert(session_id.to_string(), conversation_id.to_string());
-                save_conversation_map(&session.cwd, &map);
-            }
-            None
-        }
-        Some("step_update") => {
-            let update = step_update(value.get("step_update")?)?;
-            let notif = JsonRpcNotification::with_params(
-                "session/update",
-                SessionNotification {
-                    session_id: session_id.to_string(),
-                    update,
-                    meta: None,
-                    extra: BTreeMap::new(),
-                },
-            );
-            let _ = transport.notify(notif).await;
-            None
-        }
-        Some("result") => Some(
-            match value.pointer("/result/status").and_then(|s| s.as_str()) {
-                Some("SUCCESS") => StopReason::EndTurn,
-                Some("CANCELLED") => StopReason::Cancelled,
-                status => {
-                    warn!(status = ?status, "agy turn ended abnormally");
-                    StopReason::Error
+    /// Translate one agy NDJSON line into `session/update`s. Returns the
+    /// turn's stop reason once the `result` event arrives.
+    async fn agy_line(
+        &self,
+        turn: &Turn,
+        session_id: &SessionId,
+        tools: &mut HashMap<String, ToolCallHandle>,
+        message: &mut Option<MessageStream>,
+        thought: &mut Option<MessageStream>,
+        line: &str,
+    ) -> Option<StopReason> {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            debug!("unparsed agy line: {}", &line[..line.len().min(200)]);
+            return None;
+        };
+        match value.get("event").and_then(|e| e.as_str()) {
+            Some("init") => {
+                // First sight of the conversation id: bind it so later
+                // turns — and a later `session/load` after a crash —
+                // resume the same conversation.
+                if let Some(conversation_id) = value.get("conversation_id").and_then(|c| c.as_str())
+                    && self.conversation.lock().expect("conversation").as_deref()
+                        != Some(conversation_id)
+                {
+                    *self.conversation.lock().expect("conversation") =
+                        Some(conversation_id.to_string());
+                    let mut map = conversation_map(&self.cwd);
+                    map.insert(session_id.to_string(), conversation_id.to_string());
+                    save_conversation_map(&self.cwd, &map);
                 }
-            },
-        ),
-        _ => None,
-    }
-}
-
-/// One `step_update` payload → at most one ACP update.
-fn step_update(step: &serde_json::Value) -> Option<SessionUpdate> {
-    let step_type = step.get("step_type")?.as_str()?;
-    match step_type {
-        "agent_response" => text_chunk(step, false),
-        "agent_thought" | "thinking" => text_chunk(step, true),
-        "tool" => {
-            let id = step.get("step_index")?.as_u64()?.to_string();
-            let name = step
-                .get("tool_name")
-                .and_then(|n| n.as_str())
-                .unwrap_or_default();
-            // Classify agy's command tools so the client's blocked-tool
-            // rule works on `kind` — harness-agnostic — rather than these
-            // agy-specific names.
-            let kind = crate::handler::MAIN_BLOCKED_TOOLS
-                .contains(&name)
-                .then_some(ToolKind::Execute);
-            if step.get("state").and_then(|s| s.as_str()) == Some("ACTIVE") {
-                Some(SessionUpdate::ToolCall(ToolCall {
-                    tool_call_id: id,
-                    title: name.to_string(),
-                    kind,
-                    status: Some(ToolCallStatus::InProgress),
-                    content: Vec::new(),
-                    locations: Vec::new(),
-                    raw_input: step
-                        .get("tool_info")
-                        .and_then(|i| i.get("parameters"))
-                        .cloned(),
-                    raw_output: None,
-                    meta: None,
-                }))
-            } else {
-                Some(SessionUpdate::ToolCallUpdate(ToolCallUpdate {
-                    tool_call_id: id,
-                    status: Some(ToolCallStatus::Completed),
-                    title: None,
-                    kind,
-                    content: None,
-                    locations: None,
-                    raw_input: None,
-                    raw_output: step.get("tool_info").and_then(|i| i.get("output")).cloned(),
-                    meta: None,
-                }))
+                None
             }
+            Some("step_update") => {
+                let step = value.get("step_update")?;
+                self.step_update(turn, tools, message, thought, step).await;
+                None
+            }
+            Some("result") => Some(
+                match value.pointer("/result/status").and_then(|s| s.as_str()) {
+                    Some("SUCCESS") => StopReason::EndTurn,
+                    Some("CANCELLED") => StopReason::Cancelled,
+                    status => {
+                        warn!(status = ?status, "agy turn ended abnormally");
+                        StopReason::Error
+                    }
+                },
+            ),
+            _ => None,
         }
-        _ => None,
     }
-}
 
-/// A text delta as an `agent_message_chunk`/`agent_thought_chunk` update.
-fn text_chunk(step: &serde_json::Value, thought: bool) -> Option<SessionUpdate> {
-    let text = step.get("text_delta")?.as_str()?.to_string();
-    let chunk = ContentChunk {
-        content: ContentBlock::Text(TextContent {
-            text,
-            annotations: None,
-            meta: None,
-        }),
-        message_id: None,
-        meta: None,
-    };
-    Some(if thought {
-        SessionUpdate::AgentThoughtChunk(chunk)
-    } else {
-        SessionUpdate::AgentMessageChunk(chunk)
-    })
-}
-
-/// The ACP `initialize` result: agy loads sessions, takes text prompts,
-/// and honors `session/resume`/`close`/`list` — no image/audio prompts.
-fn initialize_result() -> InitializeResult {
-    InitializeResult {
-        protocol_version: PROTOCOL_VERSION,
-        agent_capabilities: AgentCapabilities {
-            load_session: true,
-            prompt_capabilities: PromptCapabilities {
-                image: false,
-                audio: false,
-                embedded_context: false,
-            },
-            mcp_capabilities: McpCapabilities::default(),
-            session_capabilities: SessionCapabilities {
-                resume: Some(SessionResumeCapabilities::default()),
-                close: Some(SessionCloseCapabilities::default()),
-                list: Some(SessionListCapabilities::default()),
-                ..SessionCapabilities::default()
-            },
-            ..AgentCapabilities::default()
-        },
-        agent_info: Some(Implementation {
-            name: "acpbot agy-bridge".to_string(),
-            title: None,
-            version: env!("CARGO_PKG_VERSION").to_string(),
-        }),
-        auth_methods: Vec::new(),
-        meta: None,
+    /// One `step_update` payload → tool calls and message chunks on `turn`.
+    async fn step_update(
+        &self,
+        turn: &Turn,
+        tools: &mut HashMap<String, ToolCallHandle>,
+        message: &mut Option<MessageStream>,
+        thought: &mut Option<MessageStream>,
+        step: &serde_json::Value,
+    ) {
+        let Some(step_type) = step.get("step_type").and_then(|t| t.as_str()) else {
+            return;
+        };
+        match step_type {
+            "agent_response" => {
+                if let Some(text) = step.get("text_delta").and_then(|t| t.as_str()) {
+                    let _ = message
+                        .get_or_insert_with(|| turn.message())
+                        .text(text)
+                        .await;
+                }
+            }
+            "agent_thought" | "thinking" => {
+                if let Some(text) = step.get("text_delta").and_then(|t| t.as_str()) {
+                    let _ = thought
+                        .get_or_insert_with(|| turn.thought())
+                        .text(text)
+                        .await;
+                }
+            }
+            "tool" => {
+                let Some(id) = step.get("step_index").and_then(|i| i.as_u64()) else {
+                    return;
+                };
+                let id = id.to_string();
+                let name = step
+                    .get("tool_name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or_default();
+                // Classify agy's command tools so the client's blocked-tool
+                // rule works on `kind` — harness-agnostic — rather than
+                // these agy-specific names.
+                let kind = crate::handler::MAIN_BLOCKED_TOOLS
+                    .contains(&name)
+                    .then_some(ToolKind::Execute);
+                if step.get("state").and_then(|s| s.as_str()) == Some("ACTIVE") {
+                    let mut builder = turn.tool_call(name, name);
+                    if let Some(kind) = kind {
+                        builder = builder.kind(kind);
+                    }
+                    if let Some(input) = step.get("tool_info").and_then(|i| i.get("parameters")) {
+                        builder = builder.input(input.clone());
+                    }
+                    match builder.start().await {
+                        Ok(handle) => {
+                            let _ = handle.in_progress().await;
+                            tools.insert(id, handle);
+                        }
+                        Err(error) => debug!(%error, "tool_call update failed"),
+                    }
+                } else {
+                    let output = step.get("tool_info").and_then(|i| i.get("output")).cloned();
+                    match tools.remove(&id) {
+                        Some(handle) => {
+                            let _ = handle.complete(output).await;
+                        }
+                        // A terminal step without a seen ACTIVE — emit the
+                        // completion raw so the client still retires it.
+                        None => {
+                            let mut update = ToolCallUpdate::new(ToolCallId::from(id.as_str()));
+                            update.status = Patch::Set(Open::Known(ToolCallStatus::Completed));
+                            if let Some(output) = output {
+                                update.raw_output = Patch::Set(output);
+                            }
+                            let _ = turn.update(SessionUpdate::ToolCallUpdate(update)).await;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -665,39 +540,9 @@ fn initialize_result() -> InitializeResult {
 fn prompt_text(prompt: &[ContentBlock]) -> String {
     prompt
         .iter()
-        .filter_map(|block| {
-            if let ContentBlock::Text(text) = block {
-                Some(text.text.as_str())
-            } else {
-                None
-            }
-        })
+        .filter_map(|block| block.as_text())
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-/// Parse `req.params` into `P`, producing the error response on failure.
-fn parse_params<P: serde::de::DeserializeOwned>(
-    req: &JsonRpcRequest,
-) -> std::result::Result<P, Box<JsonRpcResponse>> {
-    match req.params.clone().map(serde_json::from_value).transpose() {
-        Ok(Some(p)) => Ok(p),
-        _ => Err(Box::new(JsonRpcResponse::error(
-            req.id.clone(),
-            JsonRpcError::invalid_params(format!("bad params for {}", req.method)),
-        ))),
-    }
-}
-
-/// A fresh session id — opaque; the agy conversation id it binds is what
-/// matters.
-fn new_id() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock")
-        .as_nanos();
-    format!("{:08x}-{:032x}", std::process::id(), nanos)
 }
 
 /// Read a session cwd's `acp session id → agy conversation` map.
