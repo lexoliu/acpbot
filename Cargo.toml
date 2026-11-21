@@ -53,3 +53,6 @@ url = "2.5.8"
 # Process-group kill for `cancel_watch` — children spawn in their own
 # group so `kill(-pgid)` reaches the whole command tree.
 libc = "0.2"
+
+[lints.cargo]
+unused_dependencies = "deny"
